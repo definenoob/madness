@@ -4,8 +4,8 @@ import math
 import numpy as np
 
 # --- Constants ---
-SCREEN_WIDTH = 800
-SCREEN_HEIGHT = 600
+SCREEN_WIDTH = 1600
+SCREEN_HEIGHT = 800
 FPS = 60
 
 # --- Colors ---
@@ -38,21 +38,22 @@ PLAYER_ITEM_DROP_RANGE = 60
 PLAYER_START_DAMAGE = 1
 PLAYER_SHOOT_COOLDOWN = 300
 SQUARE_START_HEALTH = 3
+SQUARE_SPEED = 1.5 # Base speed for squares
 TRIANGLE_START_HEALTH = 2
 TRIANGLE_START_SPEED = 2.0
 TRIANGLE_SPAWN_THRESHOLD = 10
 # --- RIVAL SETTINGS ---
-RIVAL_SPAWN_THRESHOLD = 0 # Set to a reasonable threshold for progression
+RIVAL_SPAWN_THRESHOLD = 0
 RIVAL_START_HEALTH = 4
-RIVAL_HEALTH_SCALING = 2 # Health increase per rival spawned
-RIVAL_SPEED = 2.4
+RIVAL_HEALTH_SCALING = 1
+RIVAL_SPEED = 1.2
 RIVAL_ATTACK_RANGE = 200
-RIVAL_SHOOT_COOLDOWN = 1000
+RIVAL_SHOOT_COOLDOWN = 1500
 RIVAL_BULLET_SPEED = 7
 # --- DIAMOND SETTINGS ---
-DIAMOND_SPAWN_THRESHOLD_RIVALS = 2 # Spawn after this many rivals have appeared in total
+DIAMOND_SPAWN_THRESHOLD_RIVALS = 2
 DIAMOND_START_HEALTH = 5
-DIAMOND_SPEED = 2.4
+DIAMOND_SPEED = 1.8
 # -------------------------------------------
 BULLET_RADIUS = 4
 BULLET_SPEED = 12
@@ -64,6 +65,10 @@ ITEM_RADIUS = 9
 # --- AI Settings ---
 SEPARATION_FORCE = 0.5
 SEPARATION_RADIUS = 40
+# Square Evasion (NEW)
+SQUARE_EVASION_RADIUS = 150  # How far away squares detect bullets
+SQUARE_EVASION_FORCE = 25.5   # How strongly they push away from the bullet path
+# Rival Strategy
 RIVAL_OPTIMAL_FIRING_DISTANCE = 160
 RIVAL_ENEMY_AVOIDANCE_RADIUS = 50
 RIVAL_AVOIDANCE_FORCE = 1.5
@@ -295,10 +300,12 @@ class Enemy:
         self.vx += fx
         self.vy += fy
 
-        # Cap speed if necessary
+        # Cap speed if necessary, allowing bursts for dynamic movement
         max_speed_burst = self.speed * 1.5
         if isinstance(self, RivalCircle):
-             max_speed_burst = self.speed * 2.0 # Allow rivals faster bursts for dodging
+             max_speed_burst = self.speed * 2.5 # Allow rivals faster bursts for dodging
+        elif isinstance(self, SquareEnemy):
+             max_speed_burst = self.speed * 2.0 # Allow squares faster bursts for evasion
 
         current_speed = math.hypot(self.vx, self.vy)
         if current_speed > max_speed_burst:
@@ -311,18 +318,20 @@ class Enemy:
         self.y += self.vy
         self.rect.center = (self.x, self.y)
     
-    # Strategic movement logic for basic enemies (Swarm behavior)
-    def strategic_move(self, player, all_enemies):
+    # Standardized strategic movement logic (Default: Swarm behavior)
+    # obstacles: A list of entities to avoid (e.g., other enemies for separation)
+    # player_bullets: A list of player bullets (for evasion, used by some subclasses)
+    def strategic_move(self, player, obstacles, player_bullets):
         # 1. Attraction (Move towards the player)
         attraction_dx = player.x - self.x
         attraction_dy = player.y - self.y
         attraction_vx, attraction_vy = normalize_vector(attraction_dx, attraction_dy)
         
-        # 2. Separation (Avoid crowding other enemies)
+        # 2. Separation (Avoid crowding obstacles)
         separation_fx, separation_fy = 0, 0
         
-        # Use a list comprehension for efficiency when checking neighbors
-        neighbors = [other for other in all_enemies if other != self]
+        # Filter out self if present in the obstacles list
+        neighbors = [other for other in obstacles if other != self]
         
         for other in neighbors:
             distance = math.hypot(other.x - self.x, other.y - self.y)
@@ -376,8 +385,81 @@ class Enemy:
 
 class SquareEnemy(Enemy):
     def __init__(self, x, y, health):
-        super().__init__(x, y, 25, 1.5, health, SQUARE_COLOR)
+        super().__init__(x, y, 25, SQUARE_SPEED, health, SQUARE_COLOR)
         
+    # Override strategic move to include evasion
+    def strategic_move(self, player, obstacles, player_bullets):
+        # 1. Attraction (Move towards the player)
+        attraction_dx = player.x - self.x
+        attraction_dy = player.y - self.y
+        attraction_vx, attraction_vy = normalize_vector(attraction_dx, attraction_dy)
+        
+        # 2. Separation (Avoid crowding other enemies)
+        separation_fx, separation_fy = 0, 0
+        neighbors = [other for other in obstacles if other != self]
+        for other in neighbors:
+            distance = math.hypot(other.x - self.x, other.y - self.y)
+            if distance < SEPARATION_RADIUS and distance > 0:
+                force_magnitude = (1 - (distance / SEPARATION_RADIUS)) * SEPARATION_FORCE
+                dx = self.x - other.x
+                dy = self.y - other.y
+                sep_vx, sep_vy = normalize_vector(dx, dy)
+                separation_fx += sep_vx * force_magnitude
+                separation_fy += sep_vy * force_magnitude
+
+        # 3. Evasion (Dodge player bullets)
+        evasion_fx, evasion_fy = 0, 0
+        closest_threat_distance = float('inf')
+
+        for bullet in player_bullets:
+            distance = math.hypot(bullet.x - self.x, bullet.y - self.y)
+            
+            if distance < SQUARE_EVASION_RADIUS:
+                # Check if the bullet is moving towards the square.
+                # Vector from enemy to bullet
+                dx_eb = bullet.x - self.x
+                dy_eb = bullet.y - self.y
+                
+                # Dot product of (vector from enemy to bullet) and (bullet velocity)
+                # If negative, the angle between them is > 90 deg, meaning the bullet is generally approaching.
+                dot_product = dx_eb * bullet.dx + dy_eb * bullet.dy
+                
+                if dot_product < 0:
+                    # Bullet is a threat. Calculate evasion direction.
+                    # We want to move perpendicular to the bullet's trajectory.
+                    # Bullet trajectory (normalized):
+                    b_vx, b_vy = normalize_vector(bullet.dx, bullet.dy)
+                    
+                    # Perpendicular vectors (left and right relative to bullet path)
+                    # Deterministic choice: Always dodge "left" (-b_vy, b_vx) relative to the bullet's direction.
+                    perp_vx, perp_vy = -b_vy, b_vx
+                    
+                    # The force magnitude depends on how close the threat is
+                    if distance > 0:
+                        force_magnitude = (1 - (distance / SQUARE_EVASION_RADIUS)) * SQUARE_EVASION_FORCE
+                    else:
+                        force_magnitude = SQUARE_EVASION_FORCE
+
+                    # Prioritize the closest threat (only consider the most immediate danger)
+                    if distance < closest_threat_distance:
+                        evasion_fx = perp_vx * force_magnitude
+                        evasion_fy = perp_vy * force_magnitude
+                        closest_threat_distance = distance
+
+        # Combine behaviors
+        # If evading, prioritize evasion over attraction slightly
+        if closest_threat_distance != float('inf'):
+            attraction_weight = 0.5
+        else:
+            attraction_weight = 1.0
+
+        self.vx = attraction_vx * self.speed * attraction_weight
+        self.vy = attraction_vy * self.speed * attraction_weight
+        
+        # Apply separation and evasion forces
+        self.apply_force(separation_fx + evasion_fx, separation_fy + evasion_fy)
+        self.update_position()
+
     def draw(self, screen, font):
         # Rotate the square based on movement direction
         angle = math.degrees(math.atan2(self.vy, self.vx))
@@ -394,6 +476,8 @@ class TriangleEnemy(Enemy):
     def __init__(self, x, y, health, size):
         speed = TRIANGLE_START_SPEED * (1.5 if size < 30 else 1.0) # Smaller ones are faster
         super().__init__(x, y, size, speed, health, TRIANGLE_COLOR)
+    
+    # Uses the default Enemy.strategic_move (Swarm behavior, no evasion)
 
     def draw(self, screen, font):
         # Calculate points for an equilateral triangle
@@ -431,12 +515,13 @@ class TriangleEnemy(Enemy):
                     TriangleEnemy(self.x + 10, self.y, new_health, new_size)]
         return []
 
-# --- NEW ENEMY: DIAMOND ---
 class DiamondEnemy(Enemy):
     def __init__(self, x, y, health):
         # Size 30, Speed from constant
         super().__init__(x, y, 30, DIAMOND_SPEED, health, DIAMOND_COLOR)
         self.duplication_pending = False # Flag to indicate it needs to duplicate
+
+    # Uses the default Enemy.strategic_move (Swarm behavior, no evasion)
 
     def draw(self, screen, font):
         # Calculate points for a diamond (rhombus)
@@ -469,15 +554,12 @@ class DiamondEnemy(Enemy):
         
         self.draw_health_bar(screen, font)
 
-    # Diamonds use the standard strategic move (swarming).
-
     def handle_bomb(self):
         # This method is called when a bomb explodes while the diamond is on screen.
         # Instead of taking damage, it flags itself for duplication.
         self.duplication_pending = True
         # Return False as it is not destroyed by the bomb
         return False
-# ---------------------------
 
 class RivalCircle(Enemy):
     def __init__(self, x, y, health):
@@ -486,8 +568,9 @@ class RivalCircle(Enemy):
         self.last_shot_time = 0
 
     # Advanced strategic movement (Aggressive Player Hunt)
-    # 'enemies' parameter here refers to obstacles (standard enemies) the rival should avoid
-    def strategic_move(self, player, enemies):
+    # obstacles: Standard enemies the rival should avoid
+    # player_bullets: Player bullets (Rivals currently do not dodge these, prioritizing kiting)
+    def strategic_move(self, player, obstacles, player_bullets):
         
         # 1. Positioning relative to the player (Kiting/Strafing)
         distance_to_player = math.hypot(player.x - self.x, player.y - self.y)
@@ -505,11 +588,11 @@ class RivalCircle(Enemy):
             # Strafe around the player (deterministic direction: clockwise)
             move_x, move_y = py * self.speed * 0.8, -px * self.speed * 0.8
 
-        # 2. Obstacle Avoidance (Enemies)
+        # 2. Obstacle Avoidance
         avoidance_fx, avoidance_fy = 0, 0
 
         # Check against standard enemies for avoidance
-        for obstacle in enemies:
+        for obstacle in obstacles:
             # Ensure we don't avoid ourselves (safety check)
             if obstacle == self: continue
                 
@@ -572,6 +655,7 @@ class RivalCircle(Enemy):
         self.draw_health_bar(screen, font)
 
 # --- Audio Generation ---
+# (Audio generation functions and initialization remain the same as they are robust and deterministic)
 
 # Define robust initialization structure for audio
 # Dummy classes provide fallback methods if audio initialization fails.
@@ -586,8 +670,6 @@ class DummyChannel:
         def get_busy(self): return False
         # Crucial for dynamic music switching logic
         def get_sound(self): return None 
-
-# (Audio generation functions remain the same as they are robust and deterministic)
 
 def generate_sound_array(frequency, duration, sample_rate=44100, amplitude=0.5, wave_type='sine'):
     # Ensure frequency is positive
@@ -753,12 +835,11 @@ def spawn_entity(player_kills, total_entities_spawned, rivals_spawned_count):
     
     # Deterministic enemy type selection based on progression and spawn count
     
-    # --- NEW: Spawn a Diamond every 8 spawns if the rival threshold is met ---
+    # Spawn a Diamond every 8 spawns if the rival threshold is met
     if rivals_spawned_count >= DIAMOND_SPAWN_THRESHOLD_RIVALS and (total_entities_spawned + 1) % 8 == 0:
         # Health scales slightly with kills
         health = DIAMOND_START_HEALTH + (player_kills // 20)
         return DiamondEnemy(x, y, health)
-    # -----------------------------------------------------------------------
     
     # Spawn a Rival every 10 spawns after the kill threshold
     if player_kills >= RIVAL_SPAWN_THRESHOLD and (total_entities_spawned + 1) % 10 == 0:
@@ -772,7 +853,7 @@ def spawn_entity(player_kills, total_entities_spawned, rivals_spawned_count):
         return TriangleEnemy(x, y, health, 30) # Start with large size
     
     else:
-        # Default spawn: Square
+        # Default spawn: Square (Now Evasive)
         health = SQUARE_START_HEALTH + (player_kills // 15)
         return SquareEnemy(x, y, health)
 
@@ -809,10 +890,6 @@ def draw_ui(screen, player, font, spawn_cooldown, rivals_spawned_count):
     intensity_text = font.render(f"Intensity: {intensity*100:.0f}%", True, TEXT_COLOR)
     screen.blit(intensity_text, (10, stats_y + 5))
     
-    # Optional: Display Rival Count for awareness
-    # rival_count_text = font.render(f"Rivals Encountered: {rivals_spawned_count}", True, RIVAL_COLOR)
-    # screen.blit(rival_count_text, (SCREEN_WIDTH - rival_count_text.get_width() - 10, 10))
-
 
 def draw_game_over(screen, score, font, big_font):
     # Darken the screen with a semi-transparent overlay
@@ -939,7 +1016,7 @@ def game_loop(screen, clock, audio_assets):
     # Separate lists: 'enemies' for standard types (including Diamonds), 'rivals' for RivalCircles
     enemies = []
     rivals = []
-    bullets = []
+    bullets = [] # Player bullets
     rival_bullets = []
     items = []
     
@@ -1131,15 +1208,17 @@ def game_loop(screen, clock, audio_assets):
 
             # ----------------------------------------------------------------
 
-            # Enemy AI Update (Strategic Swarm)
-            # Pass the full list of standard enemies for separation logic
+            # Enemy AI Update (Strategic Swarm and Evasion)
+            # Pass the full list of standard enemies (obstacles) and player bullets (threats)
             for enemy in enemies:
-                enemy.strategic_move(player, enemies)
+                # 'enemies' list is passed as obstacles for separation logic
+                # 'bullets' list is passed for evasion logic (used by Squares)
+                enemy.strategic_move(player, enemies, bullets)
             
             # Rival AI Update (Aggressive Player Hunting)
-            # Rivals avoid standard enemies (obstacles) while hunting the player
+            # Rivals avoid standard enemies (obstacles). They currently ignore player bullets for movement.
             for rival in rivals: 
-                rival.strategic_move(player, enemies)
+                rival.strategic_move(player, enemies, bullets)
                 rival.shoot(player, rival_bullets, shot_sound)
             
             # Bullet Updates
@@ -1339,6 +1418,7 @@ def initialize_audio():
     sn = 0.075; en = 0.15; qn = 0.30; hn = 0.60
 
     # 4 distinct musical segments for dynamic intensity
+    # (Music definitions remain the same)
     # Segment 1 (Low Intensity)
     melody1 = [
         (notes['C4'], qn), (notes['Eb4'], qn), (notes['G4'], qn), (notes['Ab4'], en), (notes['G4'], en),
