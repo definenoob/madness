@@ -28,17 +28,24 @@ HEALTH_BAR_BG = (50, 50, 50)
 HEALTH_BAR_FG = (80, 255, 80)
 # Items
 BOMB_COLOR = (220, 20, 60) # Crimson
-ITEM_COLORS = {'speed': (0, 191, 255), 'range': (255, 215, 0), 'damage': (255, 69, 0), 'bomb': BOMB_COLOR}
+ITEM_COLORS = {
+    'speed': (0, 191, 255),
+    'range': (255, 215, 0),
+    'damage': (255, 69, 0),
+    'bomb': BOMB_COLOR,
+    'multishot': (200, 100, 255) # NEW: Color for Multishot item
+}
+
 
 # --- Game Settings ---
 PLAYER_RADIUS = 12
 PLAYER_START_SPEED = 4.0
-PLAYER_START_ATTACK_RANGE = 120
-PLAYER_ITEM_DROP_RANGE = 60
+PLAYER_START_ATTACK_RANGE = 250
+PLAYER_ITEM_DROP_RANGE = 100
 PLAYER_START_DAMAGE = 1
 PLAYER_SHOOT_COOLDOWN = 300
 SQUARE_START_HEALTH = 3
-SQUARE_SPEED = 1.5 # Base speed for squares
+SQUARE_SPEED = 2.5 # Base speed for squares
 TRIANGLE_START_HEALTH = 2
 TRIANGLE_START_SPEED = 2.0
 TRIANGLE_SPAWN_THRESHOLD = 10
@@ -46,8 +53,8 @@ TRIANGLE_SPAWN_THRESHOLD = 10
 RIVAL_SPAWN_THRESHOLD = 0
 RIVAL_START_HEALTH = 4
 RIVAL_HEALTH_SCALING = 1
-RIVAL_SPEED = 1.2
-RIVAL_ATTACK_RANGE = 200
+RIVAL_SPEED = 4.0
+RIVAL_ATTACK_RANGE = 250
 RIVAL_SHOOT_COOLDOWN = 1500
 RIVAL_BULLET_SPEED = 7
 # --- DIAMOND SETTINGS ---
@@ -67,7 +74,7 @@ SEPARATION_FORCE = 0.5
 SEPARATION_RADIUS = 40
 # Square Evasion (NEW)
 SQUARE_EVASION_RADIUS = 150  # How far away squares detect bullets
-SQUARE_EVASION_FORCE = 12.5   # How strongly they push away from the bullet path
+SQUARE_EVASION_FORCE = 0.0   # How strongly they push away from the bullet path
 # Rival Strategy
 RIVAL_OPTIMAL_FIRING_DISTANCE = 160
 RIVAL_ENEMY_AVOIDANCE_RADIUS = 50
@@ -106,10 +113,10 @@ def predict_target_position(shooter_x, shooter_y, target_x, target_y, target_vx,
 
         if discriminant < 0:
             # No real solution, fallback
-             if bullet_speed > 0:
-                 time_to_impact = math.hypot(dx, dy) / bullet_speed
-             else:
-                 time_to_impact = 0
+            if bullet_speed > 0:
+                time_to_impact = math.hypot(dx, dy) / bullet_speed
+            else:
+                time_to_impact = 0
         else:
             # Solutions for t
             t1 = (-b + math.sqrt(discriminant)) / (2*a)
@@ -149,6 +156,7 @@ class Player:
         self.damage = PLAYER_START_DAMAGE
         self.last_shot_time = 0
         self.kills = 0
+        self.multishot_level = 1 # NEW: Player starts with 1 bullet per shot
 
     def move(self):
         keys = pygame.key.get_pressed()
@@ -176,25 +184,32 @@ class Player:
         if not enemies or current_time - self.last_shot_time < PLAYER_SHOOT_COOLDOWN:
             return
         
+        # MODIFIED: Logic for multi-shot
         all_targets = enemies
-        # Deterministic targeting: Closest enemy
-        closest_target = min(all_targets, key=lambda e: math.hypot(e.x - self.x, e.y - self.y))
-        distance = math.hypot(closest_target.x - self.x, closest_target.y - self.y)
-
-        if distance <= self.attack_range:
-            # The player also uses predictive aiming
-            predicted_x, predicted_y = predict_target_position(
-                self.x, self.y,
-                closest_target.x, closest_target.y,
-                closest_target.vx, closest_target.vy,
-                BULLET_SPEED
-            )
-            
-            dx, dy = predicted_x - self.x, predicted_y - self.y
-            
-            bullets.append(Bullet(self.x, self.y, dx, dy, self.damage, BULLET_COLOR))
+        # Sort all potential targets by distance
+        all_targets.sort(key=lambda e: math.hypot(e.x - self.x, e.y - self.y))
+        
+        # Select the closest N targets based on multishot_level
+        targets_to_shoot = all_targets[:self.multishot_level]
+        
+        shot_fired = False
+        for target in targets_to_shoot:
+            distance = math.hypot(target.x - self.x, target.y - self.y)
+            if distance <= self.attack_range:
+                predicted_x, predicted_y = predict_target_position(
+                    self.x, self.y,
+                    target.x, target.y,
+                    target.vx, target.vy,
+                    BULLET_SPEED
+                )
+                
+                dx, dy = predicted_x - self.x, predicted_y - self.y
+                bullets.append(Bullet(self.x, self.y, dx, dy, self.damage, BULLET_COLOR))
+                shot_fired = True
+                
+        if shot_fired:
             self.last_shot_time = current_time
-            # Use find_channel to ensure sound plays without interrupting music
+            # Play sound once per volley
             channel = pygame.mixer.find_channel(True)
             if channel:
                 channel.play(shot_sound)
@@ -221,6 +236,9 @@ class Player:
         if item.type == 'speed': self.speed += 0.3
         elif item.type == 'range': self.attack_range += 10
         elif item.type == 'damage': self.damage += 1
+        elif item.type == 'multishot':
+            self.multishot_level += 1
+            RivalCircle.multishot_level += 1 # MODIFIED: Also upgrade all rivals
 
 class Bullet:
     def __init__(self, x, y, target_dx, target_dy, damage, color, speed=BULLET_SPEED):
@@ -303,16 +321,16 @@ class Enemy:
         # Cap speed if necessary, allowing bursts for dynamic movement
         max_speed_burst = self.speed * 1.5
         if isinstance(self, RivalCircle):
-             max_speed_burst = self.speed * 2.5 # Allow rivals faster bursts for dodging
+            max_speed_burst = self.speed * 2.5 # Allow rivals faster bursts for dodging
         elif isinstance(self, SquareEnemy):
-             max_speed_burst = self.speed * 2.0 # Allow squares faster bursts for evasion
+            max_speed_burst = self.speed * 2.0 # Allow squares faster bursts for evasion
 
         current_speed = math.hypot(self.vx, self.vy)
         if current_speed > max_speed_burst:
-             scale = max_speed_burst / current_speed
-             self.vx *= scale
-             self.vy *= scale
-             
+            scale = max_speed_burst / current_speed
+            self.vx *= scale
+            self.vy *= scale
+            
     def update_position(self):
         self.x += self.vx
         self.y += self.vy
@@ -489,7 +507,7 @@ class TriangleEnemy(Enemy):
         # Rotate the triangle based on movement direction
         # Handle zero velocity case (point upwards)
         if self.vx == 0 and self.vy == 0:
-             angle = -math.pi/2
+            angle = -math.pi/2
         else:
             # Align the tip (p1) with the direction of movement
             angle = math.atan2(self.vy, self.vx) - math.pi/2
@@ -533,7 +551,7 @@ class DiamondEnemy(Enemy):
 
         # Rotate the diamond based on movement direction
         if self.vx == 0 and self.vy == 0:
-             angle = 0
+            angle = 0
         else:
             # Standard rotation based on velocity
             angle = math.atan2(self.vy, self.vx)
@@ -562,6 +580,9 @@ class DiamondEnemy(Enemy):
         return False
 
 class RivalCircle(Enemy):
+    # NEW: Class attribute to track multishot level for ALL rivals
+    multishot_level = 1
+
     def __init__(self, x, y, health):
         super().__init__(x, y, 20, RIVAL_SPEED, health, RIVAL_COLOR)
         self.attack_range = RIVAL_ATTACK_RANGE
@@ -595,7 +616,7 @@ class RivalCircle(Enemy):
         for obstacle in obstacles:
             # Ensure we don't avoid ourselves (safety check)
             if obstacle == self: continue
-                
+            
             distance = math.hypot(obstacle.x - self.x, obstacle.y - self.y)
             if distance < RIVAL_ENEMY_AVOIDANCE_RADIUS and distance > 0:
                 # Calculate avoidance force
@@ -614,33 +635,44 @@ class RivalCircle(Enemy):
         self.apply_force(avoidance_fx, avoidance_fy)
         self.update_position()
 
-    def shoot(self, player, rival_bullets, shot_sound):
+    def shoot(self, player, enemies, rival_bullets, shot_sound):
         current_time = pygame.time.get_ticks()
         if current_time - self.last_shot_time < RIVAL_SHOOT_COOLDOWN:
             return
         
-        # Target is always the player
-        distance = math.hypot(player.x - self.x, player.y - self.y)
+        # MODIFIED: Target selection now includes player AND standard enemies
+        potential_targets = [player] + enemies
+        
+        # Sort all potential targets by distance to the rival
+        potential_targets.sort(key=lambda t: math.hypot(t.x - self.x, t.y - self.y))
+        
+        # Select the closest N targets based on the CLASS multishot level
+        targets_to_shoot = potential_targets[:RivalCircle.multishot_level]
+        
+        shot_fired = False
+        for target in targets_to_shoot:
+            distance = math.hypot(target.x - self.x, target.y - self.y)
+            if distance <= self.attack_range:
+                # Use predictive aiming against the target
+                predicted_x, predicted_y = predict_target_position(
+                    self.x, self.y,
+                    target.x, target.y,
+                    target.vx, target.vy,
+                    RIVAL_BULLET_SPEED
+                )
+                
+                dx = predicted_x - self.x
+                dy = predicted_y - self.y
+                
+                rival_bullets.append(Bullet(self.x, self.y, dx, dy, 1, RIVAL_BULLET_COLOR, RIVAL_BULLET_SPEED))
+                shot_fired = True
 
-        if distance <= self.attack_range:
-            # Use predictive aiming against the player (using RIVAL_BULLET_SPEED)
-            predicted_x, predicted_y = predict_target_position(
-                self.x, self.y,
-                player.x, player.y,
-                player.vx, player.vy,
-                RIVAL_BULLET_SPEED
-            )
-
-            dx = predicted_x - self.x
-            dy = predicted_y - self.y
-            
-            # Use find_channel for playing sounds
+        if shot_fired:
+            self.last_shot_time = current_time
+            # Play sound once per volley
             channel = pygame.mixer.find_channel(True)
             if channel:
                 channel.play(shot_sound)
-                
-            rival_bullets.append(Bullet(self.x, self.y, dx, dy, 1, RIVAL_BULLET_COLOR, RIVAL_BULLET_SPEED))
-            self.last_shot_time = current_time
     
     def draw(self, screen, font):
         # Draw Attack Range (very faint)
@@ -665,11 +697,11 @@ class DummySound:
     def get_busy(self): return False
 
 class DummyChannel:
-        def play(self, *args, **kwargs): pass
-        def stop(self, *args, **kwargs): pass
-        def get_busy(self): return False
-        # Crucial for dynamic music switching logic
-        def get_sound(self): return None 
+    def play(self, *args, **kwargs): pass
+    def stop(self, *args, **kwargs): pass
+    def get_busy(self): return False
+    # Crucial for dynamic music switching logic
+    def get_sound(self): return None 
 
 def generate_sound_array(frequency, duration, sample_rate=44100, amplitude=0.5, wave_type='sine'):
     # Ensure frequency is positive
@@ -689,7 +721,7 @@ def generate_sound_array(frequency, duration, sample_rate=44100, amplitude=0.5, 
         # Approximation using Fourier series
         wave = np.sin(2 * np.pi * frequency * time_array)
         if frequency * 3 < sample_rate / 2:
-             wave += (1/3) * np.sin(2 * np.pi * 3 * frequency * time_array)
+            wave += (1/3) * np.sin(2 * np.pi * 3 * frequency * time_array)
         if frequency * 5 < sample_rate / 2:
             wave += (1/5) * np.sin(2 * np.pi * 5 * frequency * time_array)
     elif wave_type == 'noise':
@@ -720,7 +752,7 @@ def generate_explosion_sound(duration=0.5, start_freq=100, end_freq=50, amplitud
 
     # Handle zero samples case
     if num_samples == 0:
-         return pygame.sndarray.make_sound(np.zeros((1, 2), dtype=np.int16))
+        return pygame.sndarray.make_sound(np.zeros((1, 2), dtype=np.int16))
 
     # Generate deterministic noise
     time_array = np.linspace(0., duration, num_samples, endpoint=False)
@@ -777,7 +809,7 @@ def generate_bass_track(note_sequence, sample_rate=44100, amplitude=0.3, wave_ty
         return DummySound()
 
     if not bass_arrays:
-         return pygame.sndarray.make_sound(np.zeros((1, 2), dtype=np.int16))
+        return pygame.sndarray.make_sound(np.zeros((1, 2), dtype=np.int16))
 
     full_bass_array = np.concatenate(bass_arrays)
     
@@ -795,7 +827,7 @@ def generate_laser_sound(duration=0.1, start_freq=600, end_freq=300):
         return DummySound()
 
     if num_samples == 0:
-         return pygame.sndarray.make_sound(np.zeros((1, 2), dtype=np.int16))
+        return pygame.sndarray.make_sound(np.zeros((1, 2), dtype=np.int16))
 
     # Ensure frequencies are positive
     start_freq = max(1e-6, start_freq)
@@ -878,7 +910,8 @@ def draw_ui(screen, player, font, spawn_cooldown, rivals_spawned_count):
     stats = [
         (f"Speed: {player.speed:.1f}", ITEM_COLORS['speed']),
         (f"Range: {player.attack_range}", ITEM_COLORS['range']),
-        (f"Damage: {player.damage}", ITEM_COLORS['damage'])
+        (f"Damage: {player.damage}", ITEM_COLORS['damage']),
+        (f"Shots: {player.multishot_level}", ITEM_COLORS['multishot']) # NEW: Display multishot level
     ]
     for text, color in stats:
         surf = font.render(text, True, color)
@@ -1013,6 +1046,9 @@ def game_loop(screen, clock, audio_assets):
     # Game state initialization
     game_active = True
     player = Player(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
+    # Reset the shared rival multishot level at the start of each game
+    RivalCircle.multishot_level = 1
+    
     # Separate lists: 'enemies' for standard types (including Diamonds), 'rivals' for RivalCircles
     enemies = []
     rivals = []
@@ -1040,9 +1076,14 @@ def game_loop(screen, clock, audio_assets):
             if event.type == pygame.QUIT:
                 pygame.quit()
                 sys.exit()
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    # This handles the ESC key
+                    pygame.quit()
+                    sys.exit()
             if not game_active:
-                 if event.type == pygame.KEYDOWN:
-                     if event.key == pygame.K_r:
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_r:
                         # Ensure music stops before restarting the function
                         music_channel_melody.stop()
                         music_channel_bass.stop()
@@ -1081,7 +1122,7 @@ def game_loop(screen, clock, audio_assets):
                         music_channel_melody.play(target_melody_track)
                         # Ensure bass track index is valid
                         if target_music_index < len(bass_tracks):
-                             music_channel_bass.play(bass_tracks[target_music_index])
+                            music_channel_bass.play(bass_tracks[target_music_index])
 
         
         if game_active:
@@ -1145,7 +1186,7 @@ def game_loop(screen, clock, audio_assets):
 
                 # Rivals are always destroyed by bombs
                 for rival in rivals:
-                     to_destroy.append(rival)
+                    to_destroy.append(rival)
 
                 # Use a set for efficient management of destruction, handling cascading deaths (splits)
                 destruction_set = set(to_destroy)
@@ -1160,7 +1201,7 @@ def game_loop(screen, clock, audio_assets):
                     # Handle Rival specific logic
                     if isinstance(target, RivalCircle):
                         if bomb_spawn_location is None:
-                             bomb_spawn_location = (target.x, target.y)
+                            bomb_spawn_location = (target.x, target.y)
                         
                         # Safely remove from the rivals list
                         if target in rivals:
@@ -1182,7 +1223,7 @@ def game_loop(screen, clock, audio_assets):
 
                 # Spawn exactly one replacement bomb if any rivals were killed
                 if bomb_spawn_location:
-                     items.append(Item(bomb_spawn_location[0], bomb_spawn_location[1], player.kills, item_type='bomb'))
+                    items.append(Item(bomb_spawn_location[0], bomb_spawn_location[1], player.kills, item_type='bomb'))
 
                 # --- Handle Duplication (Post-Bomb Effects) ---
                 new_duplicates = []
@@ -1219,7 +1260,8 @@ def game_loop(screen, clock, audio_assets):
             # Rivals avoid standard enemies (obstacles). They currently ignore player bullets for movement.
             for rival in rivals: 
                 rival.strategic_move(player, enemies, bullets)
-                rival.shoot(player, rival_bullets, shot_sound)
+                # MODIFIED: Pass 'enemies' list to shoot method for targeting
+                rival.shoot(player, enemies, rival_bullets, shot_sound)
             
             # Bullet Updates
             for b in bullets + rival_bullets:
@@ -1248,6 +1290,10 @@ def game_loop(screen, clock, audio_assets):
                             # Handle Death
                             player.kills += 1
                             
+                            # NEW: Check for Multishot Item Drop
+                            if player.kills > 0 and player.kills % 50 == 0:
+                                items.append(Item(target.x, target.y, item_type='multishot'))
+
                             # Play death sound
                             channel = pygame.mixer.find_channel(True)
                             if channel: channel.play(death_sound)
@@ -1257,7 +1303,7 @@ def game_loop(screen, clock, audio_assets):
                                 # Rivals always drop a bomb when killed by player
                                 items.append(Item(target.x, target.y, player.kills, item_type='bomb'))
                             elif math.hypot(player.x - target.x, player.y - target.y) <= player.item_drop_range:
-                                 # Standard enemies (including Diamonds) drop standard items if close enough
+                                # Standard enemies (including Diamonds) drop standard items if close enough
                                 items.append(Item(target.x, target.y, player.kills))
                             
                             # Handle splitting (Triangles)
@@ -1292,7 +1338,7 @@ def game_loop(screen, clock, audio_assets):
                 # Check against Enemies (Friendly Fire)
                 # Rivals bullets damage standard enemies (including Diamonds)
                 for enemy in enemies[:]:
-                     if enemy in enemies and bullet.rect.colliderect(enemy.rect):
+                    if enemy in enemies and bullet.rect.colliderect(enemy.rect):
                         
                         # Play hit sound
                         channel = pygame.mixer.find_channel(True)
@@ -1312,8 +1358,8 @@ def game_loop(screen, clock, audio_assets):
             
             # Physical Collision (Player vs Enemies/Rivals)
             for unit in enemies[:] + rivals[:]:
-                 # Check existence and collision
-                 if (unit in enemies or unit in rivals) and player.rect.colliderect(unit.rect):
+                # Check existence and collision
+                if (unit in enemies or unit in rivals) and player.rect.colliderect(unit.rect):
                     game_active = False
                     music_channel_melody.stop()
                     music_channel_bass.stop()
@@ -1445,14 +1491,14 @@ def initialize_audio():
         (notes['G4'], qn), (notes['F4'], qn), (notes['Eb4'], qn), (notes['D4'], qn)
     ]
     bass3 = [
-       (notes['Eb3'], hn), (notes['F3'], hn),
-       (notes['G3'], hn), (notes['Bb3'], hn)
+        (notes['Eb3'], hn), (notes['F3'], hn),
+        (notes['G3'], hn), (notes['Bb3'], hn)
     ]
 
     # Segment 4 (Max Intensity)
     melody4 = [
-       (notes['C5'],en),(notes['Eb5'],en),(notes['C5'],en),(notes['Ab4'],en), (notes['G4'],en),(notes['F4'],en),(notes['G4'],en),(notes['Ab4'],en),
-       (notes['Bb4'],en),(notes['D5'],en),(notes['Bb4'],en),(notes['G4'],en), (notes['F4'],en),(notes['Eb4'],en),(notes['F4'],en),(notes['G4'],en)
+        (notes['C5'],en),(notes['Eb5'],en),(notes['C5'],en),(notes['Ab4'],en), (notes['G4'],en),(notes['F4'],en),(notes['G4'],en),(notes['Ab4'],en),
+        (notes['Bb4'],en),(notes['D5'],en),(notes['Bb4'],en),(notes['G4'],en), (notes['F4'],en),(notes['Eb4'],en),(notes['F4'],en),(notes['G4'],en)
     ]
     bass4 = [
         (notes['C3'], en), (notes['C3'], en), (notes['C3'], en), (notes['C3'], en), (notes['F3'], en), (notes['F3'], en), (notes['F3'], en), (notes['F3'], en),
@@ -1467,7 +1513,7 @@ def initialize_audio():
     # Bass is very fast and repetitive
     bass_rival = [
         (notes['C3'], sn), (notes['C3'], sn), (notes['Eb3'], sn), (notes['C3'], sn), (notes['F3'], sn), (notes['C3'], sn), (notes['Eb3'], sn), (notes['C3'], sn),
-         (notes['Ab3'], sn), (notes['Ab3'], sn), (notes['G3'], sn), (notes['G3'], sn), (notes['F3'], sn), (notes['F3'], sn), (notes['Eb3'], sn), (notes['Eb3'], sn)
+        (notes['Ab3'], sn), (notes['Ab3'], sn), (notes['G3'], sn), (notes['G3'], sn), (notes['F3'], sn), (notes['F3'], sn), (notes['Eb3'], sn), (notes['Eb3'], sn)
     ]
 
 
@@ -1486,7 +1532,7 @@ def initialize_audio():
         # Hit sound (Short sine wave blip)
         hit_sound_array = generate_sound_array(300, 0.05, wave_type='sine', amplitude=0.4)
         if hit_sound_array.size > 0 and pygame.mixer.get_init():
-             hit_sound = pygame.sndarray.make_sound(np.ascontiguousarray(np.vstack((hit_sound_array, hit_sound_array)).T))
+            hit_sound = pygame.sndarray.make_sound(np.ascontiguousarray(np.vstack((hit_sound_array, hit_sound_array)).T))
         else:
             hit_sound = DummySound()
         
