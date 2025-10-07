@@ -25,7 +25,8 @@ RIVAL_BULLET_COLOR = (255, 50, 255) # Magenta
 HEALTH_BAR_BG = (50, 50, 50)
 HEALTH_BAR_FG = (80, 255, 80)
 # Items
-ITEM_COLORS = {'speed': (0, 191, 255), 'range': (255, 215, 0), 'damage': (255, 69, 0)}
+BOMB_COLOR = (220, 20, 60) # Crimson
+ITEM_COLORS = {'speed': (0, 191, 255), 'range': (255, 215, 0), 'damage': (255, 69, 0), 'bomb': BOMB_COLOR}
 
 # --- Game Settings ---
 PLAYER_RADIUS = 12
@@ -39,8 +40,9 @@ TRIANGLE_START_HEALTH = 2
 TRIANGLE_START_SPEED = 2.0
 TRIANGLE_SPAWN_THRESHOLD = 10
 # --- RIVAL SETTINGS ---
-RIVAL_SPAWN_THRESHOLD = 0
-RIVAL_START_HEALTH = 10
+RIVAL_SPAWN_THRESHOLD = 0 # Set to a reasonable threshold for progression
+RIVAL_START_HEALTH = 4
+RIVAL_HEALTH_SCALING = 1 # Health increase per rival spawned
 RIVAL_SPEED = 1.2
 RIVAL_ATTACK_RANGE = 200
 RIVAL_SHOOT_COOLDOWN = 1500
@@ -51,7 +53,7 @@ BULLET_SPEED = 12
 INITIAL_SPAWN_COOLDOWN = 2000
 MIN_SPAWN_COOLDOWN = 250
 SPAWN_COOLDOWN_REDUCTION_PER_KILL = 20
-ITEM_RADIUS = 9 # Adjusted slightly for font fit
+ITEM_RADIUS = 9
 
 # --- AI Settings ---
 SEPARATION_FORCE = 0.5
@@ -73,6 +75,9 @@ def predict_target_position(shooter_x, shooter_y, target_x, target_y, target_vx,
     dx = target_x - shooter_x
     dy = target_y - shooter_y
 
+    if bullet_speed <= 0:
+        return target_x, target_y
+
     # Coefficients (a*t^2 + b*t + c = 0)
     a = target_vx**2 + target_vy**2 - bullet_speed**2
     b = 2 * (dx * target_vx + dy * target_vy)
@@ -80,14 +85,14 @@ def predict_target_position(shooter_x, shooter_y, target_x, target_y, target_vx,
 
     # If 'a' is near zero, speeds are similar; fallback to direct aiming.
     if abs(a) < 1e-6:
-        time_to_impact = math.hypot(dx, dy) / bullet_speed if bullet_speed > 0 else 0
+        time_to_impact = math.hypot(dx, dy) / bullet_speed
     else:
         # Discriminant (b^2 - 4ac)
         discriminant = b**2 - 4*a*c
 
         if discriminant < 0:
             # No real solution, fallback
-             time_to_impact = math.hypot(dx, dy) / bullet_speed if bullet_speed > 0 else 0
+             time_to_impact = math.hypot(dx, dy) / bullet_speed
         else:
             # Solutions for t
             t1 = (-b + math.sqrt(discriminant)) / (2*a)
@@ -100,7 +105,7 @@ def predict_target_position(shooter_x, shooter_y, target_x, target_y, target_vx,
                 time_to_impact = t2
             else:
                 # Solutions are negative, fallback
-                time_to_impact = math.hypot(dx, dy) / bullet_speed if bullet_speed > 0 else 0
+                time_to_impact = math.hypot(dx, dy) / bullet_speed
 
     # Predict future position
     predicted_x = target_x + target_vx * time_to_impact
@@ -189,6 +194,7 @@ class Player:
 
 
     def collect_item(self, item):
+        # Bomb collection is handled in the main game loop
         if item.type == 'speed': self.speed += 0.3
         elif item.type == 'range': self.attack_range += 10
         elif item.type == 'damage': self.damage += 1
@@ -230,13 +236,19 @@ class Bullet:
     def is_offscreen(self): return not (0 < self.x < SCREEN_WIDTH and 0 < self.y < SCREEN_HEIGHT)
 
 class Item:
-    def __init__(self, x, y, kill_count):
+    # Added item_type parameter for explicit bomb creation
+    def __init__(self, x, y, kill_count=0, item_type=None):
         self.x, self.y = x, y
         self.radius = ITEM_RADIUS
-        # Deterministic item drops based on kill count modulo 3
-        item_types = ['speed', 'range', 'damage']
-        self.type = item_types[kill_count % 3]
-        self.color = ITEM_COLORS[self.type]
+
+        if item_type:
+            self.type = item_type
+        else:
+            # Deterministic item drops based on kill count modulo 3
+            item_types = ['speed', 'range', 'damage']
+            self.type = item_types[kill_count % 3]
+
+        self.color = ITEM_COLORS.get(self.type, (255, 255, 255)) # Default white if unknown
         self.rect = pygame.Rect(x - self.radius, y - self.radius, self.radius * 2, self.radius * 2)
         self.creation_time = pygame.time.get_ticks()
 
@@ -322,14 +334,14 @@ class Enemy:
         return self.health <= 0
 
     def draw_health_bar(self, screen, font):
-        # Only draw health bar if damaged
-        if self.health < self.max_health:
-            bar_width, bar_height = self.size, 4
+        # Only draw health bar if damaged or if it's a high-health Rival (to show scaling)
+        if self.health < self.max_health or (isinstance(self, RivalCircle) and self.max_health > RIVAL_START_HEALTH):
+            bar_width, bar_height = self.size * 1.5, 4 # Wider bar for visibility
             health_pct = max(0, self.health / self.max_health)
             
             # Position above the entity
             bar_x = self.x - bar_width / 2
-            bar_y = self.y - self.size / 2 - bar_height - 5
+            bar_y = self.y - self.size / 2 - bar_height - 8
             
             bg_rect = pygame.Rect(bar_x, bar_y, bar_width, bar_height)
             pygame.draw.rect(screen, HEALTH_BAR_BG, bg_rect)
@@ -395,8 +407,9 @@ class TriangleEnemy(Enemy):
         return []
 
 class RivalCircle(Enemy):
-    def __init__(self, x, y):
-        super().__init__(x, y, 20, RIVAL_SPEED, RIVAL_START_HEALTH, RIVAL_COLOR)
+    # Modified initialization to accept specific health (for scaling)
+    def __init__(self, x, y, health):
+        super().__init__(x, y, 20, RIVAL_SPEED, health, RIVAL_COLOR)
         self.attack_range = RIVAL_ATTACK_RANGE
         self.last_shot_time = 0
 
@@ -450,12 +463,12 @@ class RivalCircle(Enemy):
         distance = math.hypot(player.x - self.x, player.y - self.y)
 
         if distance <= self.attack_range:
-            # Use predictive aiming against the player
+            # Use predictive aiming against the player (using RIVAL_BULLET_SPEED)
             predicted_x, predicted_y = predict_target_position(
                 self.x, self.y,
                 player.x, player.y,
                 player.vx, player.vy,
-                BULLET_SPEED
+                RIVAL_BULLET_SPEED
             )
 
             dx = predicted_x - self.x
@@ -528,6 +541,34 @@ def generate_sound_array(frequency, duration, sample_rate=44100, amplitude=0.5, 
     sound_data = (wave * (2**15 - 1) * amplitude).astype(np.int16)
     return sound_data
 
+# Helper for generating explosion sounds (New)
+def generate_explosion_sound(duration=0.5, start_freq=100, end_freq=50, amplitude=0.7):
+    sample_rate=44100
+    num_samples = int(sample_rate * duration)
+    if num_samples == 0:
+         return pygame.sndarray.make_sound(np.zeros((1, 2), dtype=np.int16))
+
+    # Generate deterministic noise
+    time_array = np.linspace(0., duration, num_samples, endpoint=False)
+    frequency = np.linspace(start_freq, end_freq, num_samples)
+    
+    # Use frequency modulated noise for a deeper explosion sound
+    mod_freq = 40
+    mod_wave = np.sin(2 * np.pi * mod_freq * time_array)
+    wave = np.sin(2 * np.pi * (frequency + mod_wave*30) * time_array)
+
+    # Strong fade out
+    fade_out = np.linspace(1., 0., num_samples)**3
+    wave *= fade_out
+
+    max_abs = np.max(np.abs(wave))
+    wave = wave / max_abs if max_abs > 0 else wave 
+    sound_data = (wave * (2**15 - 1) * amplitude).astype(np.int16)
+    
+    stereo_sound_data = np.ascontiguousarray(np.vstack((sound_data, sound_data)).T)
+    return pygame.sndarray.make_sound(stereo_sound_data)
+
+
 def generate_full_melody_sound(note_sequence, sample_rate=44100, amplitude=0.2, wave_type='sine'):
     melody_arrays = [generate_sound_array(freq, dur, sample_rate, amplitude, wave_type) for freq, dur in note_sequence]
     # Filter out empty arrays
@@ -583,7 +624,8 @@ def generate_laser_sound(duration=0.1, start_freq=600, end_freq=300):
 
 # --- Game Logic Functions ---
 
-def spawn_entity(player_kills, total_entities_spawned):
+# Updated to handle progressive Rival health
+def spawn_entity(player_kills, total_entities_spawned, rivals_spawned_count):
     # Deterministic spawning
     spawn_sides = ['top', 'right', 'bottom', 'left']
     side = spawn_sides[total_entities_spawned % 4]
@@ -603,7 +645,9 @@ def spawn_entity(player_kills, total_entities_spawned):
     
     # Spawn a Rival every 10 spawns after the threshold
     if player_kills >= RIVAL_SPAWN_THRESHOLD and (total_entities_spawned + 1) % 10 == 0:
-        return RivalCircle(x, y)
+        # Calculate progressive health
+        health = RIVAL_START_HEALTH + (rivals_spawned_count * RIVAL_HEALTH_SCALING)
+        return RivalCircle(x, y, health)
     
     # Spawn a Triangle every 5 spawns after the threshold
     elif player_kills >= TRIANGLE_SPAWN_THRESHOLD and (total_entities_spawned + 1) % 5 == 0:
@@ -622,7 +666,6 @@ def calculate_intensity(spawn_cooldown):
         intensity = 1.0
     return max(0.0, min(1.0, intensity))
 
-# Updated draw_ui to reposition Intensity
 def draw_ui(screen, player, font, spawn_cooldown):
     # Display Kills
     score_text = font.render(f"Kills: {player.kills}", True, TEXT_COLOR)
@@ -640,11 +683,10 @@ def draw_ui(screen, player, font, spawn_cooldown):
         screen.blit(surf, (10, stats_y))
         stats_y += 25
 
-    # Display Intensity indicator (Moved from top-right to below stats)
+    # Display Intensity indicator
     intensity = calculate_intensity(spawn_cooldown)
-    # Use a neutral color for intensity
     intensity_text = font.render(f"Intensity: {intensity*100:.0f}%", True, TEXT_COLOR)
-    screen.blit(intensity_text, (10, stats_y + 5)) # Positioned below the stats
+    screen.blit(intensity_text, (10, stats_y + 5))
 
 
 def draw_game_over(screen, score, font, big_font):
@@ -728,7 +770,6 @@ def title_screen(screen, clock):
 def game_loop(screen, clock, audio_assets):
     
     # Fonts Initialization
-    # Initialize a smaller font specifically for items
     try:
         ui_font = pygame.font.SysFont('Verdana, Geneva, sans-serif', 24)
         enemy_font = pygame.font.SysFont('Verdana, Geneva, sans-serif', 16)
@@ -745,13 +786,13 @@ def game_loop(screen, clock, audio_assets):
     # Unpack Audio Assets
     melody_tracks = audio_assets['melodies']
     bass_tracks = audio_assets['bass']
-    # Unpack Rival Music
     rival_melody = audio_assets['rival_melody']
     rival_bass = audio_assets['rival_bass']
     
     shot_sound = audio_assets['shot']
     hit_sound = audio_assets['hit']
     death_sound = audio_assets['death']
+    bomb_sound = audio_assets['bomb'] # Unpack bomb sound
     music_channel_melody = audio_assets['channel_melody']
     music_channel_bass = audio_assets['channel_bass']
 
@@ -766,8 +807,12 @@ def game_loop(screen, clock, audio_assets):
     
     last_spawn_time = pygame.time.get_ticks()
     total_entities_spawned = 0
+    rivals_spawned_count = 0 # Track total rivals spawned for difficulty scaling
     spawn_cooldown = INITIAL_SPAWN_COOLDOWN
-    current_music_index = -1 # Used for intensity tracking
+    current_music_index = -1
+
+    # Visual Effects
+    flash_alpha = 0
 
     # Ensure channels are clear before starting
     music_channel_melody.stop()
@@ -793,12 +838,11 @@ def game_loop(screen, clock, audio_assets):
             is_rival_active = len(rivals) > 0
             
             if is_rival_active:
-                # Rival active: Play the rival theme if it's not the current sound playing
-                # We use get_sound() to check which track is currently loaded in the channel.
+                # Rival active: Play the rival theme
                 if music_channel_melody.get_sound() != rival_melody:
                     music_channel_melody.play(rival_melody)
                     music_channel_bass.play(rival_bass)
-                # If it is playing, ensure it loops if it finishes (as tracks are short segments)
+                # Ensure it loops
                 elif not music_channel_melody.get_busy():
                     music_channel_melody.play(rival_melody)
                     music_channel_bass.play(rival_bass)
@@ -814,8 +858,7 @@ def game_loop(screen, clock, audio_assets):
 
                     target_melody_track = melody_tracks[target_music_index]
                     
-                    # Check if the target track is different from what's currently playing OR if the music stopped (e.g. end of loop)
-                    # This also handles the transition back from the Rival theme.
+                    # Check if the target track is different or if the music stopped
                     if music_channel_melody.get_sound() != target_melody_track or not music_channel_melody.get_busy():
                         current_music_index = target_music_index
                         music_channel_melody.play(target_melody_track)
@@ -826,9 +869,11 @@ def game_loop(screen, clock, audio_assets):
             # --- Spawning Logic ---
             current_time = pygame.time.get_ticks()
             if current_time - last_spawn_time > spawn_cooldown:
-                new_entity = spawn_entity(player.kills, total_entities_spawned)
+                # Pass the rival count to spawn_entity for difficulty scaling
+                new_entity = spawn_entity(player.kills, total_entities_spawned, rivals_spawned_count)
                 if isinstance(new_entity, RivalCircle):
                     rivals.append(new_entity)
+                    rivals_spawned_count += 1 # Increment the count for the next spawn
                 else:
                     enemies.append(new_entity)
                 
@@ -844,11 +889,55 @@ def game_loop(screen, clock, audio_assets):
             player.move()
             player.shoot(enemies + rivals, bullets, shot_sound)
             
-            # Item Collection
+            # Item Collection & Bomb Activation
+            bomb_activated = False
             for item in items[:]:
                 if player.rect.colliderect(item.rect):
-                    player.collect_item(item)
+                    if item.type == 'bomb':
+                        bomb_activated = True
+                    else:
+                        player.collect_item(item)
                     items.remove(item)
+
+            # BOMB LOGIC
+            if bomb_activated:
+                pygame.mixer.find_channel(True).play(bomb_sound)
+                flash_alpha = 200 # Trigger screen flash
+
+                # Use a set to track all entities to be destroyed, handling cascading deaths (splits)
+                to_destroy = set(enemies) | set(rivals)
+                
+                # Track where to spawn the replacement bomb (location of the first rival destroyed)
+                bomb_spawn_location = None
+
+                while to_destroy:
+                    target = to_destroy.pop()
+                    # Optional: Play individual death sounds too, layered with the explosion
+                    # pygame.mixer.find_channel(True).play(death_sound) 
+
+                    # Handle Rival specific logic (Bomb drop constraint)
+                    if isinstance(target, RivalCircle):
+                        if bomb_spawn_location is None:
+                             bomb_spawn_location = (target.x, target.y)
+                        
+                        if target in rivals:
+                            rivals.remove(target)
+                    else:
+                        # Handle potential splits (e.g., Triangles)
+                        new_splits = target.on_death()
+                        # Add splits to the destruction list so they die immediately too
+                        for split in new_splits:
+                            # Add splits to the main enemy list as well for correct tracking/removal
+                            enemies.append(split) 
+                            to_destroy.add(split)
+                        
+                        if target in enemies:
+                            enemies.remove(target)
+
+                # Spawn exactly one replacement bomb if any rivals were killed
+                if bomb_spawn_location:
+                     items.append(Item(bomb_spawn_location[0], bomb_spawn_location[1], player.kills, item_type='bomb'))
+
 
             # Enemy AI Update (Strategic Swarm)
             for enemy in enemies:
@@ -871,9 +960,10 @@ def game_loop(screen, clock, audio_assets):
                     if bullet in bullets: bullets.remove(bullet)
                     continue
                 
-                all_targets = enemies + rivals
-                for target in all_targets[:]:
-                    # Ensure target still exists
+                # Iterate over copies as lists might change due to bomb effects
+                all_targets = enemies[:] + rivals[:]
+                for target in all_targets:
+                    # Ensure target still exists (might have been bombed this frame)
                     if (target in enemies or target in rivals) and bullet.rect.colliderect(target.rect):
                         pygame.mixer.find_channel(True).play(hit_sound)
                         
@@ -883,8 +973,12 @@ def game_loop(screen, clock, audio_assets):
                             player.kills += 1
                             pygame.mixer.find_channel(True).play(death_sound)
                             
-                            # Item Drop
-                            if math.hypot(player.x - target.x, player.y - target.y) <= player.item_drop_range:
+                            # Item/Bomb Drop Logic
+                            if isinstance(target, RivalCircle):
+                                # Rivals always drop a bomb when killed by player
+                                items.append(Item(target.x, target.y, player.kills, item_type='bomb'))
+                            elif math.hypot(player.x - target.x, player.y - target.y) <= player.item_drop_range:
+                                 # Standard enemies drop standard items if close enough
                                 items.append(Item(target.x, target.y, player.kills))
                             
                             # Handle splitting
@@ -930,7 +1024,7 @@ def game_loop(screen, clock, audio_assets):
 
             
             # Physical Collision (Player vs Enemies/Rivals)
-            for unit in enemies + rivals:
+            for unit in enemies[:] + rivals[:]:
                  if (unit in enemies or unit in rivals) and player.rect.colliderect(unit.rect):
                     game_active = False
                     music_channel_melody.stop()
@@ -947,6 +1041,9 @@ def game_loop(screen, clock, audio_assets):
                     if rival.rect.colliderect(enemy.rect):
                         # Mutual destruction
                         pygame.mixer.find_channel(True).play(death_sound)
+
+                        # Rival drops bomb on mutual destruction too
+                        items.append(Item(rival.x, rival.y, player.kills, item_type='bomb'))
                         
                         new_splits = enemy.on_death()
                         enemies.extend(new_splits)
@@ -975,6 +1072,13 @@ def game_loop(screen, clock, audio_assets):
                 b.draw(screen)
                 
             draw_ui(screen, player, ui_font, spawn_cooldown)
+
+            # Draw Flash effect (if active)
+            if flash_alpha > 0:
+                flash_surface = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+                flash_surface.fill((255, 255, 255, min(flash_alpha, 255)))
+                screen.blit(flash_surface, (0, 0))
+                flash_alpha = max(0, flash_alpha - 20) # Fade out quickly
             
         else:
             # Game Over State
@@ -987,7 +1091,7 @@ def game_loop(screen, clock, audio_assets):
 
 # --- Initialization Helper ---
 
-# Added Rival Music Generation
+# Added Rival Music Generation and Bomb Sound
 def initialize_audio():
     # Initialize Mixer
     try:
@@ -999,7 +1103,7 @@ def initialize_audio():
         dummy_channel = DummyChannel()
         return {
             'melodies': [DummySound()], 'bass': [DummySound()], 'shot': DummySound(), 'hit': DummySound(), 'death': DummySound(),
-            'rival_melody': DummySound(), 'rival_bass': DummySound(),
+            'bomb': DummySound(), 'rival_melody': DummySound(), 'rival_bass': DummySound(),
             'channel_melody': dummy_channel, 'channel_bass': dummy_channel
         }
 
@@ -1084,9 +1188,12 @@ def initialize_audio():
         
         death_sound_array = generate_sound_array(80, 0.2, wave_type='noise', amplitude=0.5)
         death_sound = pygame.sndarray.make_sound(np.ascontiguousarray(np.vstack((death_sound_array, death_sound_array)).T))
+
+        # Bomb Sound (Deeper and louder explosion)
+        bomb_sound = generate_explosion_sound()
+
         
         # Reserve specific channels for music
-        # Channels returned by pygame.mixer.Channel support get_sound() natively
         music_channel_melody = pygame.mixer.Channel(0)
         music_channel_bass = pygame.mixer.Channel(1)
 
@@ -1099,6 +1206,7 @@ def initialize_audio():
             'shot': shot_sound,
             'hit': hit_sound,
             'death': death_sound,
+            'bomb': bomb_sound,
             'channel_melody': music_channel_melody,
             'channel_bass': music_channel_bass
         }
@@ -1108,7 +1216,7 @@ def initialize_audio():
         dummy_channel = DummyChannel()
         return {
             'melodies': [DummySound()], 'bass': [DummySound()], 'shot': DummySound(), 'hit': DummySound(), 'death': DummySound(),
-            'rival_melody': DummySound(), 'rival_bass': DummySound(),
+            'bomb': DummySound(), 'rival_melody': DummySound(), 'rival_bass': DummySound(),
             'channel_melody': dummy_channel, 'channel_bass': dummy_channel
         }
 
