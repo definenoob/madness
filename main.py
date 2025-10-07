@@ -67,7 +67,7 @@ SEPARATION_FORCE = 0.5
 SEPARATION_RADIUS = 40
 # Square Evasion (NEW)
 SQUARE_EVASION_RADIUS = 150  # How far away squares detect bullets
-SQUARE_EVASION_FORCE = 25.5   # How strongly they push away from the bullet path
+SQUARE_EVASION_FORCE = 12.5   # How strongly they push away from the bullet path
 # Rival Strategy
 RIVAL_OPTIMAL_FIRING_DISTANCE = 160
 RIVAL_ENEMY_AVOIDANCE_RADIUS = 50
