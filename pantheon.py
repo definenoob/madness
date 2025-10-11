@@ -8,7 +8,7 @@ from panda3d.core import (
     AmbientLight, DirectionalLight,
     NodePath, TextNode,
     GeomVertexFormat, GeomVertexData, Geom, GeomTriangles, GeomPoints, GeomNode, GeomVertexWriter,
-    LineSegs, CollisionNode, CollisionSphere, CollisionTraverser, CollisionHandlerEvent, BitMask32,
+    LineSegs, Quat,
     RenderModeAttrib
 )
 from direct.gui.OnscreenText import OnscreenText
@@ -16,7 +16,7 @@ from direct.task import Task
 
 # --- Configuration & Constants ---
 STARTING_WORLD_RADIUS = 350.0
-MIN_WORLD_RADIUS = 125.0
+MIN_WORLD_RADIUS = 50.0
 WORLD_SHRINK_SPEED = 0.5
 
 # Time Dilation Settings
@@ -27,7 +27,8 @@ MAX_TIME_DILATOR = 1.0
 # Rocket Settings
 ROCKET_FORWARD_SPEED = 45.0
 ROCKET_TURN_SPEED = 55.0
-TURN_RADIUS_DECREASE_PER_KILL = 0.25
+TURN_RADIUS_DECREASE_PER_KILL = 0.05
+TURN_PENALTY_ON_MISS = 0.01 # Every missed shot increases turn radius
 MIN_SPAWN_SEPARATION = 15.0
 
 # Combat Settings
@@ -35,27 +36,39 @@ ROCKET_HITBOX_RADIUS = 0.75
 ROCKET_BODY_RADIUS = 0.75
 BULLET_RADIUS = 0.5
 BULLET_SPEED = 90.0
-BULLET_LIFETIME = 2.0
-SHOOT_COOLDOWN = 0.5
+BULLET_LIFETIME = 1.0 # This is now the fixed lifetime for all bullets
+SHOOT_COOLDOWN = 0.6
 
 # AI Settings
 AI_OPTIMAL_DISTANCE = 60.0
-AI_EVASION_RADIUS = 35.0
 AI_SHOOT_RANGE = 90.0
-AI_BULLET_AWARENESS_RADIUS = 50.0
+# Pathfinding constants
+AI_PATHFINDING_RADIUS = 75.0 # How far the AI "looks" for bullets to pathfind around
+AI_PATHFINDING_LEAD_TIME = 0.75 # How far ahead in time it projects its path
+AI_FEELER_ANGLE = 30.0 # Angle of the pathfinding "feelers"
+# Evasion constants
+AI_TAIL_AWARENESS_RADIUS = 70.0
+AI_TAIL_DOT_THRESHOLD = -0.9 # How directly behind a pursuer must be
+AI_TAIL_AIM_THRESHOLD = 0.95 # How accurately the pursuer must be aiming
+AI_OPPORTUNISTIC_SHOT_THRESHOLD = 0.98 # How accurately the AI must be aiming for a potshot
+# Targeting constants
 AI_PRIORITY_DISTANCE_WEIGHT = 0.8
 AI_PRIORITY_KILLS_WEIGHT = 0.25
-AI_DODGE_THRESHOLD = 2.0
+### NEW ###
+# Desperation move constants
+AI_SURROUNDED_RADIUS = 60.0 # Distance to check for nearby enemies
+AI_SURROUNDED_THRESHOLD = 3  # Number of enemies to trigger panic
+AI_PANIC_SPIN_SPEED = 120.0  # How fast it spins during the move
+AI_PANIC_DURATION_MIN = 1.0  # Minimum duration of the panic state in seconds
+AI_PANIC_DURATION_MAX = 2.5  # Maximum duration of the panic state in seconds
+
 
 # Camera Settings
 CAMERA_CHASE_SPEED = 4.0
 DEFAULT_ZOOM = 50.0
 MIN_ZOOM = 100.0
-MAX_ZOOM = 300.0
+MAX_ZOOM = 1000.0
 ZOOM_SPEED = 150.0
-
-# Collision Masks
-ROCKET_MASK = BitMask32.bit(1)
 
 # Colors
 BACKGROUND_COLOR = LColor(0.08, 0.08, 0.12, 1)
@@ -69,12 +82,13 @@ WIN_COLOR = LColor(0.2, 1.0, 0.6, 1)
 
 # --- CPU BULLET CLASS ---
 class Bullet:
-    def __init__(self, pos, velocity, shooter):
+    def __init__(self, pos, velocity, shooter, max_age):
         self.pos = pos
         self.velocity = velocity
         self.shooter = shooter
         self.age = 0.0
         self.is_active = True
+        self.max_age = max_age
 
 # --- Procedural Geometry Functions ---
 def create_cone(segments=16, height=2.0, radius=0.7):
@@ -146,6 +160,7 @@ class Rocket(NodePath):
         self.kills = 0
 
         color = PLAYER_COLOR if self.is_player else ENEMY_COLOR
+        
         scale = Vec3(1.5, 2.5, 1.5)
         self.model = create_cone()
         self.model.reparentTo(self)
@@ -164,6 +179,14 @@ class Rocket(NodePath):
         self.target = None
         self.look_at_sphere_surface()
 
+        # State for tail evasion maneuver
+        self.evasion_timer = 0.0
+        self.evade_dir = 1
+        
+        ### NEW ###
+        # State for desperation move
+        self.panic_timer = 0.0
+
         self.hitbox_collision_pos = Point3(0, -1.0, 0)
         hitbox_model = create_icosphere(1)
         hitbox_model.reparentTo(self)
@@ -177,20 +200,10 @@ class Rocket(NodePath):
         hitbox_mat = Material(); hitbox_mat.setEmission(HITBOX_COLOR * 0.8)
         hitbox_model.setMaterial(hitbox_mat, 1); hitbox_model.setLightOff()
 
-        self.c_np = self.attachNewNode(CollisionNode("Rocket"))
-        self.c_np.node().addSolid(CollisionSphere(self.hitbox_collision_pos, ROCKET_HITBOX_RADIUS))
-        self.c_np.node().setFromCollideMask(ROCKET_MASK)
-        self.c_np.node().setIntoCollideMask(ROCKET_MASK)
-        self.c_np.setPythonTag("owner", self)
-        if self.getScale().x != self.getScale().y or self.getScale().y != self.getScale().z:
-             self.c_np.setScale(1/self.getScale().x, 1/self.getScale().y, 1/self.getScale().z)
-
     def register_kill(self):
         self.kills += 1
-        # MODIFIED: Increase turn speed
         if TURN_RADIUS_DECREASE_PER_KILL < 1.0:
             self.current_turn_speed *= (1 / (1 - TURN_RADIUS_DECREASE_PER_KILL))
-        # NEW: Increase forward speed by 5% and update velocity
         self.speed *= 1.05
         self.velocity = normalized_vector(self.velocity) * self.speed
 
@@ -224,9 +237,11 @@ class Rocket(NodePath):
             self.shoot_timer = SHOOT_COOLDOWN
             spawn_pos = self.getPos() + self._last_forward * 4.0
             self.game.spawn_bullet(spawn_pos, self._last_forward, self)
-            # NEW: Decrease speed by 1% for firing and update velocity
+            
+            # Apply all penalties instantly on firing
             self.speed *= 0.99
             self.velocity = normalized_vector(self.velocity) * self.speed
+            self.current_turn_speed *= (1.0 - TURN_PENALTY_ON_MISS)
 
     def control(self, dt):
         key_map = self.game.key_map
@@ -238,27 +253,6 @@ class Rocket(NodePath):
             turn_force = right * turn_value * self.current_turn_speed
             self.velocity = normalized_vector(self.velocity + turn_force * dt) * self.speed
         if key_map.get("space", 0): self.shoot()
-
-    def perceive_threats(self, all_bullets):
-        most_dangerous_bullet = None
-        highest_threat = 0.0
-        my_pos = self.getPos()
-        for bullet in all_bullets:
-            if bullet.shooter == self or not bullet.is_active: continue
-            rel_pos = my_pos - bullet.pos
-            dist_sq = rel_pos.length_squared()
-            if dist_sq > AI_BULLET_AWARENESS_RADIUS ** 2: continue
-            rel_vel = self.velocity - bullet.velocity
-            closing_speed = rel_pos.dot(rel_vel)
-            if closing_speed < 0: continue
-            t_cpa = -rel_pos.dot(rel_vel) / rel_vel.length_squared() if rel_vel.length_squared() > 0 else 0
-            if t_cpa < 0 or t_cpa > 1.5: continue
-            d_cpa_sq = (rel_pos + rel_vel * t_cpa).length_squared()
-            threat = 1.0 / (d_cpa_sq + t_cpa + 0.1)
-            if threat > highest_threat:
-                highest_threat = threat
-                most_dangerous_bullet = bullet
-        return most_dangerous_bullet, highest_threat
 
     def select_target(self, all_other_rockets):
         best_target = None
@@ -275,73 +269,135 @@ class Rocket(NodePath):
                 best_target = r
         return best_target
 
-    def calculate_intercept(self, target):
-        p_s, v_t, t_s = self.getPos(), target.velocity, target.getPos()
-        s_p = BULLET_SPEED
-        delta_p, delta_v = t_s - p_s, v_t
-        a = delta_v.dot(delta_v) - s_p * s_p
-        b = 2 * delta_v.dot(delta_p)
-        c = delta_p.dot(delta_p)
-        discriminant = b * b - 4 * a * c
-        if discriminant < 0: return None
-        sqrt_d = math.sqrt(discriminant)
-        t1, t2 = (-b + sqrt_d) / (2 * a), (-b - sqrt_d) / (2 * a)
-        solution_time = -1
-        if t1 > 0 and t2 > 0: solution_time = min(t1, t2)
-        elif t1 > 0: solution_time = t1
-        elif t2 > 0: solution_time = t2
-        else: return None
-        if solution_time > BULLET_LIFETIME: return None
-        return t_s + v_t * solution_time
+    def evaluate_path_danger(self, path_dir, all_bullets):
+        danger = 0.0
+        projected_pos = self.getPos() + path_dir * self.speed * AI_PATHFINDING_LEAD_TIME
+        
+        for bullet in all_bullets:
+            if not bullet.is_active or bullet.shooter == self:
+                continue
+
+            vec_to_path = projected_pos - bullet.pos
+            dist_sq = vec_to_path.length_squared()
+
+            if dist_sq < AI_PATHFINDING_RADIUS ** 2:
+                threat = 1.0 / (dist_sq + 1.0)
+                dir_to_path = normalized_vector(vec_to_path)
+                bullet_dir = normalized_vector(bullet.velocity)
+                dot = bullet_dir.dot(dir_to_path)
+
+                if dot > 0:
+                    threat *= (1 + dot * 2)
+
+                danger += threat
+        return danger
 
     def update_ai(self, dt, all_other_rockets, all_bullets):
         my_pos = self.getPos()
+        my_forward = normalized_vector(self.velocity)
         up = normalized_vector(my_pos)
-        most_dangerous_bullet, highest_threat = self.perceive_threats(all_bullets)
-        if not self.target or not self.target.is_active or random.random() < 0.1:
-            self.target = self.select_target(all_other_rockets)
-        if not self.target:
-            self.velocity = normalized_vector(self.velocity) * self.speed
-            return
-        target_velocity_dir = Vec3(0)
-        if most_dangerous_bullet and highest_threat > AI_DODGE_THRESHOLD:
-            dir_from_threat = normalized_vector(my_pos - most_dangerous_bullet.pos)
-            dodge_dir_1 = dir_from_threat.cross(up)
-            dodge_dir_2 = -dodge_dir_1
-            my_future_pos = my_pos + self.velocity * dt
-            bullet_future_pos = most_dangerous_bullet.pos + most_dangerous_bullet.velocity * dt
-            dist_1_sq = (my_future_pos + dodge_dir_1 - bullet_future_pos).length_squared()
-            dist_2_sq = (my_future_pos + dodge_dir_2 - bullet_future_pos).length_squared()
-            target_velocity_dir = dodge_dir_1 if dist_1_sq > dist_2_sq else dodge_dir_2
-        else:
-            target_pos = self.target.getPos()
-            dist_to_target = (my_pos - target_pos).length()
-            intercept_point = self.calculate_intercept(self.target)
-            if intercept_point:
-                dir_to_intercept = (intercept_point - my_pos).normalized()
-                dir_to_intercept = (dir_to_intercept - up * dir_to_intercept.dot(up)).normalized()
-                if dist_to_target > AI_OPTIMAL_DISTANCE * 1.5:
-                    target_velocity_dir = dir_to_intercept
-                elif dist_to_target < AI_EVASION_RADIUS:
-                    dir_away = (my_pos - target_pos).normalized()
-                    target_velocity_dir = (dir_away - up * dir_away.dot(up)).normalized()
-                else:
-                    circle_dir = normalized_vector(target_pos - my_pos).cross(up)
-                    target_velocity_dir = normalized_vector(dir_to_intercept * 0.7 + circle_dir * 0.3)
+        right = my_forward.cross(up)
+        
+        ### NEW ###
+        # --- 1. Highest Priority: Desperation Spin-and-Shoot ---
+        if self.panic_timer > 0:
+            self.panic_timer -= dt
+            # Spin rapidly in a random direction (chosen once at the start of panic)
+            turn_force = right * self.evade_dir * AI_PANIC_SPIN_SPEED
+            self.velocity = normalized_vector(self.velocity + turn_force * dt) * self.speed
+            # Shoot as fast as possible
+            self.shoot()
+            return # Skip all other logic
+
+        # Check if we should ENTER the panic state
+        surrounded_count = 0
+        for r in all_other_rockets:
+            if (r.getPos() - my_pos).length_squared() < AI_SURROUNDED_RADIUS ** 2:
+                surrounded_count += 1
+        
+        if surrounded_count >= AI_SURROUNDED_THRESHOLD:
+            self.panic_timer = random.uniform(AI_PANIC_DURATION_MIN, AI_PANIC_DURATION_MAX)
+            self.evade_dir = random.choice([-1, 1]) # Pick a spin direction
+            return # End AI logic for this frame, panic will start next frame
+
+        target_velocity_dir = None
+        
+        # --- 2. High Priority: Evade a tailing rocket ---
+        tailing_rocket = None
+        for r in all_other_rockets:
+            vec_to_r = r.getPos() - my_pos
+            dist_sq = vec_to_r.length_squared()
+
+            if dist_sq < AI_TAIL_AWARENESS_RADIUS ** 2:
+                if my_forward.dot(normalized_vector(r.getPos() - my_pos)) < AI_TAIL_DOT_THRESHOLD:
+                    their_forward = normalized_vector(r.velocity)
+                    vec_from_them_to_me = my_pos - r.getPos()
+                    if their_forward.dot(normalized_vector(vec_from_them_to_me)) > AI_TAIL_AIM_THRESHOLD:
+                        tailing_rocket = r
+                        break
+
+        if tailing_rocket:
+            if self.evasion_timer <= 0:
+                self.evasion_timer = random.uniform(0.5, 1.2)
+                self.evade_dir = random.choice([-1, 1])
+            target_velocity_dir = right * self.evade_dir
+            self.evasion_timer -= dt
+        
+        # --- 3. Medium Priority: Pathfind through bullets ---
+        if target_velocity_dir is None:
+            self.evasion_timer = 0
+            q = Quat()
+            q.setFromAxisAngle(AI_FEELER_ANGLE, up)
+            dir_left = q.xform(my_forward)
+            
+            q.setFromAxisAngle(-AI_FEELER_ANGLE, up)
+            dir_right = q.xform(my_forward)
+
+            danger_straight = self.evaluate_path_danger(my_forward, all_bullets)
+            danger_left = self.evaluate_path_danger(dir_left, all_bullets)
+            danger_right = self.evaluate_path_danger(dir_right, all_bullets)
+
+            if danger_straight <= danger_left and danger_straight <= danger_right:
+                target_velocity_dir = my_forward
+            elif danger_left < danger_right:
+                target_velocity_dir = dir_left
             else:
-                dir_to_target = (target_pos - my_pos).normalized()
-                target_velocity_dir = (dir_to_target - up * dir_to_target.dot(up)).normalized()
-        if target_velocity_dir.length_squared() > 0:
-            self.velocity = normalized_vector(self.velocity + target_velocity_dir * self.current_turn_speed * dt) * self.speed
+                target_velocity_dir = dir_right
+
+        if target_velocity_dir is None:
+             target_velocity_dir = my_forward
+
+        # --- 4. Low Priority: Hunt a target ---
+        if not self.target or not self.target.is_active or random.random() < 0.05:
+            self.target = self.select_target(all_other_rockets)
+        
         if self.target:
-            dir_to_target_current = normalized_vector(self.target.getPos() - my_pos)
-            angle = normalized_vector(self.velocity).dot(dir_to_target_current)
-            if (my_pos - self.target.getPos()).length() < AI_SHOOT_RANGE and angle > 0.95:
+            target_pos = self.target.getPos()
+            target_forward = normalized_vector(self.target.velocity) if self.target.velocity.length_squared() > 0 else self.target._last_forward
+            tail_position = target_pos - target_forward * AI_OPTIMAL_DISTANCE
+            dir_to_tail = (tail_position - my_pos)
+            dir_to_tail_on_plane = (dir_to_tail - up * dir_to_tail.dot(up)).normalized()
+            
+            final_dir = (target_velocity_dir * 0.6 + dir_to_tail_on_plane * 0.4).normalized()
+        else:
+            final_dir = target_velocity_dir
+
+        if final_dir.length_squared() > 0:
+            self.velocity = normalized_vector(self.velocity + final_dir * self.current_turn_speed * dt) * self.speed
+        
+        # --- 5. Independent opportunistic shooting ---
+        for potential_shot_target in all_other_rockets:
+            if not potential_shot_target.is_active: continue
+            dir_to_potential_target = normalized_vector(potential_shot_target.getPos() - my_pos)
+            angle = my_forward.dot(dir_to_potential_target)
+            dist_sq = (my_pos - potential_shot_target.getPos()).length_squared()
+
+            if dist_sq < AI_SHOOT_RANGE ** 2 and angle > AI_OPPORTUNISTIC_SHOT_THRESHOLD:
                 self.shoot()
+                break 
 
     def destroy(self):
         self.is_active = False
-        if self.c_np: self.c_np.removeNode()
         if not self.isEmpty(): self.removeNode()
 
 # --- Main Game Application ---
@@ -352,16 +408,13 @@ class RocketSphere(ShowBase):
         self.setup_lights()
         self.setup_input()
 
-        self.cTrav = CollisionTraverser("traverser")
-        self.coll_handler = CollisionHandlerEvent()
-        self.setup_collisions()
-
         self.game_active = False
         self.ui_elements = {}
         self.player_ref = None
         self.all_rockets = []
         self.all_bullets = []
-        self.zoom_level = DEFAULT_ZOOM
+        
+        self.zoom_level = MAX_ZOOM
         self.time_dilator = 1.0
         
         self.bullet_vdata = None
@@ -386,10 +439,6 @@ class RocketSphere(ShowBase):
         for key in keys_to_map:
             self.accept(key, self.set_key, [key, 1])
             self.accept(f"{key}-up", self.set_key, [key, 0])
-
-    def setup_collisions(self):
-        self.coll_handler.addInPattern('%fn-into-%in')
-        self.accept('Rocket-into-Rocket', self.on_rocket_collision)
 
     def setup_cpu_simulation(self):
         vformat = GeomVertexFormat.get_v3c4()
@@ -432,18 +481,18 @@ class RocketSphere(ShowBase):
         self.current_world_radius = STARTING_WORLD_RADIUS
         self.create_world()
         self.setup_cpu_simulation()
-
+        
         spawn_points = self.generate_spawn_points(STARTING_ROCKETS)
         random.shuffle(spawn_points)
 
         for i in range(STARTING_ROCKETS):
             is_player = (i == 0)
-            pos = spawn_points[i]
+            pos = spawn_points.pop()
             rocket = Rocket(self, pos, is_player=is_player)
             self.all_rockets.append(rocket)
-            if is_player: self.player_ref = rocket
+            if is_player:
+                self.player_ref = rocket
             rocket.reparentTo(self.render)
-            self.cTrav.addCollider(rocket.c_np, self.coll_handler)
 
         self.setup_camera()
         self.game_active = True
@@ -532,7 +581,7 @@ class RocketSphere(ShowBase):
         for bullet in self.all_bullets:
             if not bullet.is_active: continue
             bullet.age += dt
-            if bullet.age > BULLET_LIFETIME:
+            if bullet.age > bullet.max_age:
                 bullet.is_active = False
                 continue
             new_pos = bullet.pos + bullet.velocity * dt
@@ -587,44 +636,47 @@ class RocketSphere(ShowBase):
         interp_factor = 1.0 - math.exp(-dt * WORLD_SHRINK_SPEED)
         self.current_world_radius += (target_radius - self.current_world_radius) * interp_factor
         self.world_sphere.setScale(self.current_world_radius)
-
+        
     def game_loop(self, task):
         if not self.game_active: return Task.done
         self.update_time_dilator()
         self.update_world_shrink(globalClock.getDt())
+        
         dt = min(globalClock.getDt() * self.time_dilator, 1/30.0)
+        
         for rocket in self.all_rockets:
-            if rocket.is_player: rocket.control(dt)
+            if rocket.is_player:
+                rocket.control(dt)
             else:
                 other_rockets = [r for r in self.all_rockets if r != rocket and r.is_active]
                 rocket.update_ai(dt, other_rockets, self.all_bullets)
+            
             rocket.update(dt)
+        
         self.update_bullets_cpu(dt)
         self.update_bullet_geom()
+
         rockets_to_remove = [r for r in self.all_rockets if not r.is_active]
         if rockets_to_remove:
             self.all_rockets = [r for r in self.all_rockets if r.is_active]
             for r in rockets_to_remove: r.destroy()
+            
         self.handle_zoom(dt)
         self.update_camera(dt)
         self.update_game_ui()
-        self.cTrav.traverse(self.render)
+        
         if self.game_active:
             is_player_alive = self.player_ref and self.player_ref.is_active
             if not is_player_alive: self.handle_game_over()
             elif len(self.all_rockets) == 1 and self.all_rockets[0].is_player: self.handle_game_won()
+            
         return Task.cont
 
     def spawn_bullet(self, pos, direction, shooter):
         vel = direction * BULLET_SPEED
-        bullet = Bullet(pos, vel, shooter)
+        max_age = BULLET_LIFETIME 
+        bullet = Bullet(pos, vel, shooter, max_age)
         self.all_bullets.append(bullet)
-
-    def on_rocket_collision(self, entry):
-        rocket1 = entry.getFromNodePath().getNetPythonTag("owner")
-        rocket2 = entry.getIntoNodePath().getNetPythonTag("owner")
-        if rocket1: rocket1.is_active = False
-        if rocket2: rocket2.is_active = False
 
     def handle_game_over(self):
         if not self.game_active: return
@@ -645,11 +697,16 @@ class RocketSphere(ShowBase):
         rockets_left_text = f"Rockets Left: {len(self.all_rockets)}"
         
         player_speed = self.player_ref.speed if is_player_alive else 0
-        speed_text = f"Player Speed: {player_speed:.1f}"
+        speed_text = f"Speed: {player_speed:.1f}"
+        
+        player_turn_speed = self.player_ref.current_turn_speed if is_player_alive else 0
+        turn_speed_text = f"Turn: {player_turn_speed:.1f}"
 
         self.update_ui_text("Health", health_text, (-1.3, 0.9), 0.05, align=TextNode.ALeft)
         self.update_ui_text("Enemies", rockets_left_text, (1.3, 0.9), 0.05, align=TextNode.ARight)
-        self.update_ui_text("Speed", speed_text, (0, -0.95), 0.05, align=TextNode.ACenter)
+        self.update_ui_text("PlayerSpeed", speed_text, (-1.3, -0.9), 0.05, align=TextNode.ALeft)
+        self.update_ui_text("TurnSpeed", turn_speed_text, (1.3, -0.9), 0.05, align=TextNode.ARight)
+
 
     def show_title_screen(self):
         self.clear_ui()
