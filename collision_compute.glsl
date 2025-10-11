@@ -1,86 +1,95 @@
-#version 430
+#version 430 core
 
-// Define the data structure for a Rocket's hitbox
-struct Rocket {
-    vec3 position;
-    float radius;
-    int is_active; // Use as a boolean (1 for active, 0 for destroyed)
-    vec3 padding; // GLSL requires structs to be aligned to 16-byte boundaries
+// Must match COMPUTE_GROUP_SIZE in Python
+layout (local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+// Define the data structures for the SSBOs
+
+struct RocketData {
+    vec4 position_radius; // xyz = position, w = hitbox radius
+    int is_active;
+    vec3 padding;
 };
 
-// Define the data structure for a Bullet
-struct Bullet {
-    vec3 position;
-    float age;
+struct BulletData {
+    vec4 position_padding; // xyz = position
     vec3 velocity;
     float lifetime;
 };
 
-// Input/Output buffer for all rockets in the scene
-layout(std430, binding = 0) buffer RocketBuffer {
-    Rocket rockets[];
+// Bind the SSBOs
+// layout(std140) ensures standard packing recognizable by the CPU side (struct.pack_into)
+layout(std140, binding = 0) buffer RocketBuffer {
+    RocketData rockets[];
 };
 
-// Input/Output buffer for all bullets in the scene
-layout(std430, binding = 1) buffer BulletBuffer {
-    Bullet bullets[];
+layout(std140, binding = 1) buffer BulletBuffer {
+    BulletData bullets[];
 };
 
-// Global inputs from the Python script
+// Uniform inputs
 uniform float dt;
 uniform float world_radius;
 uniform int num_rockets;
-
-// The number of parallel threads to launch (should match the number of bullets)
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+uniform float bullet_radius;
 
 void main() {
-    // Get the unique index for this specific thread/bullet
     uint index = gl_GlobalInvocationID.x;
 
-    // Read this thread's bullet data from the buffer
-    Bullet b = bullets[index];
-
-    // If the bullet is already dead, do nothing.
-    if (b.lifetime <= 0.0) {
+    if (index >= bullets.length()) {
         return;
     }
 
-    // --- 1. Update Physics ---
-    b.age += dt;
+    // Load bullet data
+    BulletData bullet = bullets[index];
 
-    // Calculate new position and keep it on the sphere's surface
-    vec3 new_pos = b.position + b.velocity * dt;
+    if (bullet.lifetime <= 0.0) {
+        return;
+    }
+
+    // Update lifetime
+    bullet.lifetime -= dt;
+    
+    // Update position
+    vec3 new_pos = bullet.position_padding.xyz + bullet.velocity * dt;
+    
+    // Keep the bullet near the sphere surface
     vec3 new_pos_norm = normalize(new_pos);
-    b.position = new_pos_norm * world_radius;
+    // Offset slightly to prevent clipping
+    new_pos = new_pos_norm * (world_radius + 0.1); 
 
-    // Re-project velocity to be tangent to the new position
-    b.velocity -= new_pos_norm * dot(b.velocity, new_pos_norm);
+    // Update velocity vector to be tangent to the new position
+    bullet.velocity -= new_pos_norm * dot(bullet.velocity, new_pos_norm);
 
-    // --- 2. Collision Detection ---
-    bool hit_something = false;
-    for (int i = 0; i < num_rockets; i++) {
-        // Only check against active rockets
-        if (rockets[i].is_active == 1) {
-            float dist = distance(b.position, rockets[i].position);
-            float min_dist = rockets[i].radius + bullets[index].age * 0.5; // Bullet radius is a placeholder, could be passed in
+    // Collision Detection (Bullet vs Rockets)
+    bool collided = false;
+    for (int i = 0; i < num_rockets; ++i) {
+        // Ensure we don't check against inactive rockets
+        if (rockets[i].is_active == 0) {
+            continue;
+        }
 
-            if (dist < min_dist) {
-                // Collision occurred! Mark the rocket for destruction.
-                // atomicExchange ensures that multiple bullets hitting the same rocket
-                // in the same frame don't cause a data-writing conflict.
-                atomicExchange(rockets[i].is_active, 0);
-                hit_something = true;
-            }
+        vec3 rocket_pos = rockets[i].position_radius.xyz;
+        float rocket_radius = rockets[i].position_radius.w;
+        
+        // Simple sphere-sphere collision check
+        float dist_sq = dot(new_pos - rocket_pos, new_pos - rocket_pos);
+        float combined_radius = rocket_radius + bullet_radius;
+        
+        if (dist_sq < (combined_radius * combined_radius)) {
+            // Mark rocket as inactive (destroyed)
+            // Use atomicExchange to ensure thread safety when writing to the buffer
+            atomicExchange(rockets[i].is_active, 0);
+            collided = true;
+            break; // Bullet is destroyed upon impact
         }
     }
 
-    // --- 3. Update Bullet State ---
-    // If we hit something, or if the bullet's lifetime has expired, mark it for deletion.
-    if (hit_something || b.age > b.lifetime) {
-        b.lifetime = -1.0; // Set lifetime to a negative value to signify it's dead
+    if (collided) {
+        bullet.lifetime = 0.0;
     }
 
-    // Write the updated bullet data back to the buffer
-    bullets[index] = b;
+    // Write back updated bullet data
+    bullet.position_padding.xyz = new_pos;
+    bullets[index] = bullet;
 }

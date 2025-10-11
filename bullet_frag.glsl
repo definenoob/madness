@@ -1,12 +1,11 @@
-#version 330
+#version 430 core
 
-// The final output color
-out vec4 fragColor;
+// Input from vertex shader
+in vec4 fragColor;
+
+// Output color
+out vec4 outputColor;
 
 void main() {
-    // Make the point a circle instead of a square
-    if (length(gl_PointCoord - vec2(0.5)) > 0.5) {
-        discard;
-    }
-    fragColor = vec4(1.0, 0.8, 0.5, 1.0); // Bullet Color
+    outputColor = fragColor;
 }

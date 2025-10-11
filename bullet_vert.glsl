@@ -1,32 +1,36 @@
-#version 330
+#version 430 core
 
-// Use the same Bullet data structure
-struct Bullet {
-    vec3 position;
-    float age;
+// Standard Panda3D input
+uniform mat4 p3d_ModelViewProjectionMatrix;
+
+struct BulletData {
+    vec4 position_padding;
     vec3 velocity;
     float lifetime;
 };
 
-// Input buffer of all bullets (read-only for this shader)
-layout(std430, binding = 1) buffer BulletBuffer {
-    Bullet bullets[];
+// Bind the SSBO (must match the binding point in the compute shader)
+layout(std140, binding = 1) buffer BulletBuffer {
+    BulletData bullets[];
 };
 
-// Standard Panda3D transform matrix
-uniform mat4 p3d_ModelViewProjectionMatrix;
+// Output to fragment shader
+out vec4 fragColor;
 
 void main() {
-    // Get this bullet's data
-    Bullet b = bullets[gl_VertexID];
+    // Use the vertex ID to look up the corresponding bullet data
+    int index = gl_VertexID;
+    BulletData bullet = bullets[index];
 
-    // If the bullet is alive, calculate its screen position.
-    // If it's dead (lifetime < 0), set its size to 0 to hide it.
-    if (b.lifetime > 0.0) {
-        gl_Position = p3d_ModelViewProjectionMatrix * vec4(b.position, 1.0);
-        gl_PointSize = 10.0; // Make points 10 pixels wide
+    if (bullet.lifetime > 0.0) {
+        // Set the position from the buffer data
+        gl_Position = p3d_ModelViewProjectionMatrix * vec4(bullet.position_padding.xyz, 1.0);
+        
+        // Simple visualization color (e.g., yellow/orange)
+        fragColor = vec4(1.0, 0.8, 0.5, 1.0);
     } else {
-        gl_Position = vec4(0, 0, 0, 0); // Effectively hides the vertex
-        gl_PointSize = 0.0;
+        // If the bullet is inactive, discard it (by setting position to 0)
+        gl_Position = vec4(0.0, 0.0, 0.0, 0.0);
+        fragColor = vec4(0.0);
     }
 }
