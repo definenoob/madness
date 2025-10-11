@@ -32,8 +32,6 @@ TURN_PENALTY_ON_MISS = 0.01 # Every missed shot increases turn radius
 MIN_SPAWN_SEPARATION = 15.0
 
 # Combat Settings
-ROCKET_HITBOX_RADIUS = 0.75
-ROCKET_BODY_RADIUS = 0.75
 BULLET_RADIUS = 0.5
 BULLET_SPEED = 90.0
 BULLET_LIFETIME = 2.0 # This is now the fixed lifetime for all bullets
@@ -54,8 +52,8 @@ AI_ACE_TURN_BONUS = 1.25 # 25% more agile
 AI_JINK_INTERVAL = 1.5 # How often an AI considers jinking
 AI_JINK_CHANCE = 0.9 # 50% chance to jink when the timer is up
 AI_JINK_DURATION = 0.3 # How long the jink maneuver lasts
-# Spin Bot settings
-NUM_SPIN_BOTS = 10
+# Hunt Bot settings
+NUM_HUNT_BOTS = 10
 
 # Camera Settings
 CAMERA_CHASE_SPEED = 4.0
@@ -68,9 +66,8 @@ ZOOM_SPEED = 150.0
 BACKGROUND_COLOR = LColor(0.08, 0.08, 0.12, 1)
 PLAYER_COLOR = LColor(0.1, 0.6, 1.0, 1)
 ENEMY_COLOR = LColor(1, 0.2, 0.2, 1)
-SPIN_BOT_COLOR = LColor(0.9, 0.1, 0.7, 1) # Bright magenta for spin bots
+HUNT_BOT_COLOR = LColor(1.0, 0.5, 0.1, 1) # Orange for hunt bots
 BULLET_COLOR = LColor(1.0, 0.8, 0.5, 1)
-HITBOX_COLOR = LColor(1, 0.75, 0.05, 1)
 TEXT_COLOR = LColor(0.94, 0.94, 0.94, 1)
 WIN_COLOR = LColor(0.2, 1.0, 0.6, 1)
 
@@ -152,19 +149,19 @@ def normalized_vector(v):
 
 # --- Game Classes ---
 class Rocket(NodePath):
-    def __init__(self, game, pos, is_player=False, is_spin_bot=False):
+    def __init__(self, game, pos, is_player=False, is_hunt_bot=False):
         super().__init__("Rocket")
         self.game = game
         self.is_player = is_player
-        self.is_spin_bot = is_spin_bot
+        self.is_hunt_bot = is_hunt_bot
         self.is_active = True
         self.kills = 0
         self.is_ace = False
 
         if self.is_player:
             color = PLAYER_COLOR
-        elif self.is_spin_bot:
-            color = SPIN_BOT_COLOR
+        elif self.is_hunt_bot:
+            color = HUNT_BOT_COLOR
         else:
             color = ENEMY_COLOR
         
@@ -180,7 +177,7 @@ class Rocket(NodePath):
         self.speed = ROCKET_FORWARD_SPEED
         self.base_turn_speed = ROCKET_TURN_SPEED
         
-        if not self.is_player and not self.is_spin_bot and random.random() < AI_ACE_CHANCE:
+        if not self.is_player and not self.is_hunt_bot and random.random() < AI_ACE_CHANCE:
             self.is_ace = True
             self.speed *= AI_ACE_SPEED_BONUS
             self.base_turn_speed *= AI_ACE_TURN_BONUS
@@ -197,19 +194,6 @@ class Rocket(NodePath):
         
         self.jink_timer = random.uniform(0, AI_JINK_INTERVAL)
         self.jinking_time_left = 0.0
-
-        self.hitbox_collision_pos = Point3(0, -1.0, 0)
-        hitbox_model = create_icosphere(1)
-        hitbox_model.reparentTo(self)
-        hitbox_model.setPos(self.hitbox_collision_pos)
-        hitbox_model.setScale(
-            ROCKET_HITBOX_RADIUS / self.getScale().x,
-            ROCKET_HITBOX_RADIUS / self.getScale().y,
-            ROCKET_HITBOX_RADIUS / self.getScale().z
-        )
-        hitbox_model.setColor(HITBOX_COLOR)
-        hitbox_mat = Material(); hitbox_mat.setEmission(HITBOX_COLOR * 0.8)
-        hitbox_model.setMaterial(hitbox_mat, 1); hitbox_model.setLightOff()
 
     def register_kill(self):
         self.kills += 1
@@ -246,7 +230,11 @@ class Rocket(NodePath):
             if self.jink_timer > 0: self.jink_timer -= dt
 
     def shoot(self):
-        if self.shoot_timer <= 0:
+        # N+1 bullet rule: You can have N kills + 1 bullets out at a time.
+        my_active_bullets = sum(1 for b in self.game.all_bullets if b.shooter == self and b.is_active)
+        max_bullets_allowed = self.kills + 1
+        
+        if my_active_bullets < max_bullets_allowed and self.shoot_timer <= 0:
             self.shoot_timer = SHOOT_COOLDOWN
             spawn_pos = self.getPos() + self._last_forward * 4.0
             self.game.spawn_bullet(spawn_pos, self._last_forward, self)
@@ -298,20 +286,39 @@ class Rocket(NodePath):
         return aim_dir
 
     def update_ai(self, dt, all_other_rockets, all_bullets):
-        # --- Spin Bot Logic ---
-        if self.is_spin_bot:
-            # 1. Spin continuously
-            up = normalized_vector(self.getPos())
-            forward = normalized_vector(self.velocity)
-            right = forward.cross(up)
-            # Use a constant turn value of 1 to always turn in one direction
-            turn_force = right * 1.0 * self.current_turn_speed
-            self.velocity = normalized_vector(self.velocity + turn_force * dt) * self.speed
+        # --- Hunt Bot Logic ---
+        if self.is_hunt_bot:
+            my_pos = self.getPos()
+            my_forward = normalized_vector(self.velocity)
+            closest_target = None
+            min_dist_sq = float('inf')
+
+            # 1. Find the nearest enemy
+            for r in all_other_rockets:
+                if not r.is_active: continue
+                dist_sq = (my_pos - r.getPos()).length_squared()
+                if dist_sq < min_dist_sq:
+                    min_dist_sq = dist_sq
+                    closest_target = r
             
-            # 2. Shoot as fast as possible
-            self.shoot()
-            
-            # Skip the normal AI routine
+            # 2. Chase and shoot the target
+            if closest_target:
+                # --- Chasing Logic ---
+                up = normalized_vector(my_pos)
+                dir_to_target = (closest_target.getPos() - my_pos)
+                # Project direction onto the sphere's tangent plane
+                final_dir = (dir_to_target - up * dir_to_target.dot(up)).normalized()
+
+                if final_dir.length_squared() > 0:
+                    # Apply a strong turning force towards the target
+                    turn_force = final_dir * self.current_turn_speed
+                    self.velocity = normalized_vector(self.velocity + turn_force * dt) * self.speed
+                
+                # --- Shooting Logic ---
+                # Only shoot if there is a clear shot solution
+                aim_dir = self.get_intercept_solution(closest_target)
+                if my_forward.dot(aim_dir) > AI_LEAD_SHOT_ACCURACY:
+                    self.shoot()
             return
 
         # --- Standard AI Logic ---
@@ -456,10 +463,10 @@ class RocketSphere(ShowBase):
 
         for i in range(STARTING_ROCKETS):
             is_player = (i == 0)
-            # The first NUM_SPIN_BOTS AIs (i=1 to NUM_SPIN_BOTS) will be spin bots
-            is_spin_bot = not is_player and (i <= NUM_SPIN_BOTS)
+            # The first NUM_HUNT_BOTS AIs (i=1 to NUM_HUNT_BOTS) will be hunt bots
+            is_hunt_bot = not is_player and (i <= NUM_HUNT_BOTS)
             pos = spawn_points.pop()
-            rocket = Rocket(self, pos, is_player=is_player, is_spin_bot=is_spin_bot)
+            rocket = Rocket(self, pos, is_player=is_player, is_hunt_bot=is_hunt_bot)
             self.all_rockets.append(rocket)
             if is_player:
                 self.player_ref = rocket
@@ -561,27 +568,44 @@ class RocketSphere(ShowBase):
             bullet.velocity -= new_pos_norm * bullet.velocity.dot(new_pos_norm)
             for rocket in self.all_rockets:
                 if not rocket.is_active or rocket == bullet.shooter: continue
-                pA_local = Point3(0, 2.5, 0)
-                pB_local = Point3(0, -2.5, 0)
-                pA_world = self.render.getRelativePoint(rocket, pA_local)
-                pB_world = self.render.getRelativePoint(rocket, pB_local)
-                segment_vec = pB_world - pA_world
-                len_sq = segment_vec.length_squared()
-                if len_sq == 0: closest_point_on_segment = pA_world
-                else:
-                    bullet_vec = bullet.pos - pA_world
-                    t = max(0, min(1, segment_vec.dot(bullet_vec) / len_sq))
-                    closest_point_on_segment = pA_world + segment_vec * t
-                dist_sq = (bullet.pos - closest_point_on_segment).length_squared()
-                min_dist = ROCKET_BODY_RADIUS + BULLET_RADIUS
-                if dist_sq < min_dist * min_dist:
+
+                # --- Cone Collision Detection ---
+                # Transform bullet's world position to the rocket's local space.
+                # In local space, the cone model has height=2.0 and radius=0.7.
+                bullet_local_pos = rocket.getRelativePoint(self.render, bullet.pos)
+
+                # Define the cone's properties based on its original model dimensions
+                cone_height = 2.0
+                cone_radius = 0.7
+                apex_y = cone_height / 2.0  # Cone points along positive Y
+                base_y = -cone_height / 2.0
+
+                # Unpack bullet's local coordinates for clarity
+                bx, by, bz = bullet_local_pos.x, bullet_local_pos.y, bullet_local_pos.z
+
+                # 1. Check if the bullet is within the height-range of the cone
+                if not (base_y <= by <= apex_y):
+                    continue
+
+                # 2. Calculate the cone's radius at the bullet's y-position
+                # This is a linear interpolation from apex (radius=0) to base (radius=cone_radius)
+                interp_factor = (apex_y - by) / cone_height
+                radius_at_y = cone_radius * interp_factor
+                
+                # 3. Calculate the bullet's squared distance from the cone's central axis (the Y-axis)
+                dist_sq_from_axis = bx * bx + bz * bz
+
+                # 4. Check for collision, adding the bullet's radius to the cone's radius at that point
+                total_radius = radius_at_y + BULLET_RADIUS
+                if dist_sq_from_axis < total_radius * total_radius:
                     rockets_to_destroy.add(rocket)
                     bullet.is_active = False
                     if bullet.shooter and bullet.shooter.is_active:
                         bullet.shooter.register_kill()
                         if bullet.shooter.is_player:
                             self.round_pnl += KILL_REWARD
-                    break
+                    break # Bullet is used up, move to the next bullet
+
         self.all_bullets = [b for b in self.all_bullets if b.is_active]
         for rocket in rockets_to_destroy:
             rocket.is_active = False
@@ -682,26 +706,48 @@ class RocketSphere(ShowBase):
     def update_game_ui(self):
         if not self.game_active: return
         is_player_alive = self.player_ref and self.player_ref.is_active
-        health_text = f"Hull Integrity: {'100%' if is_player_alive else 'BREACHED'}"
+        
+        # Player specific stats
+        if is_player_alive:
+            player_kills = self.player_ref.kills
+            max_bullets = player_kills + 1
+            active_bullets = sum(1 for b in self.all_bullets if b.shooter == self.player_ref and b.is_active)
+            ammo_text = f"Ammo: {active_bullets}/{max_bullets}"
+            kills_text = f"Kills: {player_kills}"
+            player_speed = self.player_ref.speed
+            player_turn_speed = self.player_ref.current_turn_speed
+            health_text = "Hull Integrity: 100%"
+        else:
+            ammo_text = "Ammo: N/A"
+            kills_text = "Kills: N/A"
+            player_speed = 0
+            player_turn_speed = 0
+            health_text = "Hull Integrity: BREACHED"
+
         rockets_left_text = f"Rockets Left: {len(self.all_rockets)}"
-        
-        player_speed = self.player_ref.speed if is_player_alive else 0
         speed_text = f"Speed: {player_speed:.1f}"
-        
-        player_turn_speed = self.player_ref.current_turn_speed if is_player_alive else 0
         turn_speed_text = f"Turn: {player_turn_speed:.1f}"
 
+        # Top-left UI
         self.update_ui_text("Health", health_text, (-1.3, 0.9), 0.05, align=TextNode.ALeft)
+        self.update_ui_text("Kills", kills_text, (-1.3, 0.85), 0.05, align=TextNode.ALeft)
+
+        # Top-right UI
         self.update_ui_text("Enemies", rockets_left_text, (1.3, 0.9), 0.05, align=TextNode.ARight)
+
+        # Bottom-left UI
+        self.update_ui_text("Ammo", ammo_text, (-1.3, -0.85), 0.05, align=TextNode.ALeft)
         self.update_ui_text("PlayerSpeed", speed_text, (-1.3, -0.9), 0.05, align=TextNode.ALeft)
+        
+        # Bottom-right UI
         self.update_ui_text("TurnSpeed", turn_speed_text, (1.3, -0.9), 0.05, align=TextNode.ARight)
 
+        # Center top UI (P&L)
         total_pnl_color = WIN_COLOR if self.total_pnl >= 0 else ENEMY_COLOR
         self.update_ui_text("TotalPnl", f"Total P&L: ${self.total_pnl + self.round_pnl:+.2f}", (0, 0.9), 0.05, color=total_pnl_color)
         
         round_pnl_color = WIN_COLOR if self.round_pnl >= 0 else ENEMY_COLOR
         self.update_ui_text("RoundPnl", f"Round P&L: ${self.round_pnl:+.2f}", (0, 0.8), 0.05, color=round_pnl_color)
-
 
     def show_title_screen(self):
         self.clear_ui()
