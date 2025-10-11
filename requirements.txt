@@ -1,2 +1,4 @@
 pygame==2.5.2
-numpy==1.26.4
+numpy==2.3.3
+panda3d
+scipy==1.16.2
