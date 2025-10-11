@@ -1,50 +1,47 @@
 import sys
 import math
 import random
-import struct
 
 from direct.showbase.ShowBase import ShowBase
 from panda3d.core import (
     Vec3, Point3, LColor, Material,
     AmbientLight, DirectionalLight,
-    NodePath, TextNode, Shader,
+    NodePath, TextNode,
     GeomVertexFormat, GeomVertexData, Geom, GeomTriangles, GeomPoints, GeomNode, GeomVertexWriter,
     LineSegs, CollisionNode, CollisionSphere, CollisionTraverser, CollisionHandlerEvent, BitMask32,
-    Texture, PTA_float,
-    RenderModeAttrib, ShaderAttrib
+    RenderModeAttrib
 )
 from direct.gui.OnscreenText import OnscreenText
 from direct.task import Task
 
 # --- Configuration & Constants ---
-WORLD_RADIUS = 500.0
+STARTING_WORLD_RADIUS = 350.0
+MIN_WORLD_RADIUS = 125.0
+WORLD_SHRINK_SPEED = 0.5
 
 # Time Dilation Settings
 STARTING_ROCKETS = 100
-MIN_TIME_DILATOR = 0.2
+MIN_TIME_DILATOR = 0.5
 MAX_TIME_DILATOR = 2.0
 
 # Rocket Settings
 ROCKET_FORWARD_SPEED = 45.0
 ROCKET_TURN_SPEED = 55.0
-MIN_SPAWN_SEPARATION = 15.0 
+TURN_BONUS_PER_KILL = 2.5 # NEW: How much faster a rocket turns after a kill
+MIN_SPAWN_SEPARATION = 15.0
 
 # Combat Settings
-ROCKET_HITBOX_RADIUS = 0.75 
+ROCKET_HITBOX_RADIUS = 0.75
 BULLET_RADIUS = 0.5
 BULLET_SPEED = 90.0
-BULLET_LIFETIME = 2.0 
+BULLET_LIFETIME = 2.0
+SHOOT_COOLDOWN = 0.2
 
 # AI Settings
 AI_OPTIMAL_DISTANCE = 50.0
 AI_EVASION_RADIUS = 30.0
 AI_SHOOT_RANGE = 80.0
-AI_DODGE_RADIUS = 25.0
-
-# --- GPU ACCELERATION SETTINGS ---
-MAX_BULLETS = 10000
-COMPUTE_GROUP_SIZE = 128 # Must match local_size_x in compute shader
-SHOOT_COOLDOWN = 0.2 
+AI_BULLET_AWARENESS_RADIUS = 40.0 # NEW: How far the AI will "see" bullets to dodge
 
 # Camera Settings
 CAMERA_CHASE_SPEED = 4.0
@@ -55,7 +52,6 @@ ZOOM_SPEED = 150.0
 
 # Collision Masks
 ROCKET_MASK = BitMask32.bit(1)
-BULLET_MASK = BitMask32.bit(2)
 
 # Colors
 BACKGROUND_COLOR = LColor(0.08, 0.08, 0.12, 1)
@@ -66,6 +62,16 @@ HITBOX_COLOR = LColor(1, 0.75, 0.05, 1)
 TEXT_COLOR = LColor(0.94, 0.94, 0.94, 1)
 WIN_COLOR = LColor(0.2, 1.0, 0.6, 1)
 
+
+# --- CPU BULLET CLASS ---
+class Bullet:
+    # MODIFIED: Added shooter to track kills
+    def __init__(self, pos, velocity, shooter):
+        self.pos = pos
+        self.velocity = velocity
+        self.shooter = shooter # The rocket that fired this bullet
+        self.age = 0.0
+        self.is_active = True
 
 # --- Procedural Geometry Functions ---
 def create_cone(segments=16, height=2.0, radius=0.7):
@@ -126,22 +132,16 @@ def create_icosphere(subdivisions=2):
 # --- Helper Functions ---
 def normalized_vector(v):
     return v.normalized() if v.length_squared() > 1e-6 else Vec3(0)
-def distance_on_sphere(pos1, pos2):
-    cos_theta = max(-1.0, min(1.0, normalized_vector(pos1).dot(normalized_vector(pos2))))
-    return WORLD_RADIUS * math.acos(cos_theta)
-def get_direction_on_sphere(start_pos, end_pos):
-    plane_normal = start_pos.cross(end_pos)
-    direction = plane_normal.cross(start_pos)
-    return normalized_vector(direction)
 
 # --- Game Classes ---
 class Rocket(NodePath):
-
     def __init__(self, game, pos, is_player=False):
         super().__init__("Rocket")
         self.game = game
         self.is_player = is_player
-        
+        self.is_active = True
+        self.turn_speed_bonus = 0.0 # NEW: Bonus turn speed from kills
+
         color = PLAYER_COLOR if self.is_player else ENEMY_COLOR
         scale = Vec3(1.5, 2.5, 1.5)
         self.model = create_cone()
@@ -151,7 +151,7 @@ class Rocket(NodePath):
         self.model.setMaterial(mat, 1)
         self.setScale(scale)
         self.setPos(pos)
-        
+
         self.speed = ROCKET_FORWARD_SPEED
         self.turn_speed = ROCKET_TURN_SPEED
         self._last_forward = self.calculate_initial_forward()
@@ -159,13 +159,10 @@ class Rocket(NodePath):
         self.shoot_timer = 0.0
         self.target = None
         self.look_at_sphere_surface()
-        
-        # --- FIX IS HERE ---
-        # Store the position as an instance attribute
-        self.hitbox_collision_pos = Point3(0, -1.0, 0) 
+
+        self.hitbox_collision_pos = Point3(0, -1.0, 0)
         hitbox_model = create_icosphere(1)
         hitbox_model.reparentTo(self)
-        # Use the new attribute here
         hitbox_model.setPos(self.hitbox_collision_pos)
         hitbox_model.setScale(
             ROCKET_HITBOX_RADIUS / self.getScale().x,
@@ -177,19 +174,23 @@ class Rocket(NodePath):
         hitbox_model.setMaterial(hitbox_mat, 1); hitbox_model.setLightOff()
 
         self.c_np = self.attachNewNode(CollisionNode("Rocket"))
-        # And use the new attribute here as well
         self.c_np.node().addSolid(CollisionSphere(self.hitbox_collision_pos, ROCKET_HITBOX_RADIUS))
         self.c_np.node().setFromCollideMask(ROCKET_MASK)
         self.c_np.node().setIntoCollideMask(ROCKET_MASK)
+        self.c_np.setPythonTag("owner", self)
         if self.getScale().x != self.getScale().y or self.getScale().y != self.getScale().z:
-            self.c_np.setScale(1/self.getScale().x, 1/self.getScale().y, 1/self.getScale().z)
+             self.c_np.setScale(1/self.getScale().x, 1/self.getScale().y, 1/self.getScale().z)
+
+    # NEW: Method to increase turn speed on kill
+    def register_kill(self):
+        self.turn_speed_bonus += TURN_BONUS_PER_KILL
 
     def calculate_initial_forward(self):
         up = normalized_vector(self.getPos())
         ref = Vec3(0, 1, 0)
         if abs(up.dot(ref)) > 0.99: ref = Vec3(1, 0, 0)
         return normalized_vector(ref.cross(up))
-        
+
     def look_at_sphere_surface(self, forward_vector=None):
         up = normalized_vector(self.getPos())
         if forward_vector is None:
@@ -204,16 +205,16 @@ class Rocket(NodePath):
         if self.velocity.length_squared() > 0:
             new_pos = self.getPos() + self.velocity * dt
             new_pos_norm = normalized_vector(new_pos)
-            self.setPos(new_pos_norm * WORLD_RADIUS)
+            self.setPos(new_pos_norm * self.game.current_world_radius)
             self.velocity -= new_pos_norm * self.velocity.dot(new_pos_norm)
         self.look_at_sphere_surface()
         if self.shoot_timer > 0: self.shoot_timer -= dt
-        
+
     def shoot(self):
         if self.shoot_timer <= 0:
             self.shoot_timer = SHOOT_COOLDOWN
             spawn_pos = self.getPos() + self._last_forward * 4.0
-            self.game.spawn_bullet(spawn_pos, self._last_forward)
+            self.game.spawn_bullet(spawn_pos, self._last_forward, self)
 
     def control(self, dt):
         key_map = self.game.key_map
@@ -222,27 +223,69 @@ class Rocket(NodePath):
             up = normalized_vector(self.getPos())
             forward = normalized_vector(self.velocity)
             right = forward.cross(up)
-            turn_force = right * turn_value * self.turn_speed
+            # MODIFIED: Use current total turn speed
+            current_turn_speed = self.turn_speed + self.turn_speed_bonus
+            turn_force = right * turn_value * current_turn_speed
             self.velocity = normalized_vector(self.velocity + turn_force * dt) * self.speed
         if key_map.get("space", 0): self.shoot()
 
-    def update_ai(self, dt, all_other_rockets):
-        if not all_other_rockets: return
-        self.target = min(all_other_rockets, key=lambda r: distance_on_sphere(self.getPos(), r.getPos()))
-        
-        dist_to_target = distance_on_sphere(self.getPos(), self.target.getPos())
-        dir_to_target = get_direction_on_sphere(self.getPos(), self.target.getPos())
-        
+    # MODIFIED: AI now takes the bullet list to check for threats
+    def update_ai(self, dt, all_other_rockets, all_bullets):
+        my_pos = self.getPos()
+        up = normalized_vector(my_pos)
         target_velocity_dir = Vec3(0)
-        if dist_to_target < AI_EVASION_RADIUS: target_velocity_dir = -dir_to_target
-        elif dist_to_target > AI_OPTIMAL_DISTANCE: target_velocity_dir = dir_to_target
-        else: target_velocity_dir = dir_to_target.cross(normalized_vector(self.getPos()))
         
-        self.velocity = normalized_vector(self.velocity + target_velocity_dir * self.turn_speed * dt) * self.speed
+        # --- NEW: Bullet Evasion Logic ---
+        closest_threat = None
+        min_threat_dist_sq = AI_BULLET_AWARENESS_RADIUS ** 2
+
+        for bullet in all_bullets:
+            # Don't dodge own bullets
+            if bullet.shooter == self:
+                continue
+
+            dir_to_bullet = my_pos - bullet.pos
+            dist_sq = dir_to_bullet.length_squared()
+
+            if dist_sq < min_threat_dist_sq:
+                # Check if the bullet is generally heading towards us
+                if dir_to_bullet.dot(bullet.velocity) < 0:
+                    min_threat_dist_sq = dist_sq
+                    closest_threat = bullet
         
-        if dist_to_target < AI_SHOOT_RANGE: self.shoot()
+        if closest_threat:
+            # A bullet is threatening us, prioritize dodging
+            dir_from_threat = normalized_vector(my_pos - closest_threat.pos)
+            # Dodge perpendicular to the threat direction, tangent to the sphere
+            dodge_dir = dir_from_threat.cross(up)
+            target_velocity_dir = dodge_dir
+        else:
+            # --- Original AI Logic: No immediate threats, proceed as normal ---
+            if not all_other_rockets: return
+            self.target = min(all_other_rockets, key=lambda r: (my_pos - r.getPos()).length_squared())
+            
+            target_pos = self.target.getPos()
+            dist_to_target = (my_pos - target_pos).length()
+            dir_to_target = normalized_vector(target_pos - my_pos)
+            dir_to_target = (dir_to_target - up * dir_to_target.dot(up)).normalized()
+
+            if dist_to_target < AI_EVASION_RADIUS:
+                target_velocity_dir = -dir_to_target
+            elif dist_to_target > AI_OPTIMAL_DISTANCE:
+                target_velocity_dir = dir_to_target
+            else:
+                target_velocity_dir = dir_to_target.cross(up)
         
+        # Apply the chosen turning force
+        current_turn_speed = self.turn_speed + self.turn_speed_bonus
+        self.velocity = normalized_vector(self.velocity + target_velocity_dir * current_turn_speed * dt) * self.speed
+        
+        # Shooting logic remains the same (can shoot while dodging)
+        if self.target and (my_pos - self.target.getPos()).length() < AI_SHOOT_RANGE:
+            self.shoot()
+
     def destroy(self):
+        self.is_active = False
         if self.c_np: self.c_np.removeNode()
         if not self.isEmpty(): self.removeNode()
 
@@ -253,24 +296,24 @@ class RocketSphere(ShowBase):
         self.setBackgroundColor(BACKGROUND_COLOR)
         self.setup_lights()
         self.setup_input()
-        
+
         self.cTrav = CollisionTraverser("traverser")
         self.coll_handler = CollisionHandlerEvent()
         self.setup_collisions()
-        
+
         self.game_active = False
         self.ui_elements = {}
-        self.player_ref = None 
+        self.player_ref = None
         self.all_rockets = []
+        self.all_bullets = []
         self.zoom_level = DEFAULT_ZOOM
         self.time_dilator = 1.0
-
-        self.compute_node = None
-        self.rocket_buffer = None
-        self.bullet_buffer = None
-        self.bullet_node = None
-        self.bullet_write_index = 0
         
+        self.bullet_vdata = None
+        self.bullet_geom_node = None
+        
+        self.current_world_radius = STARTING_WORLD_RADIUS
+
         self.show_title_screen()
         self.accept("escape", sys.exit)
         self.accept("r", self.restart_game)
@@ -293,48 +336,24 @@ class RocketSphere(ShowBase):
         self.coll_handler.addInPattern('%fn-into-%in')
         self.accept('Rocket-into-Rocket', self.on_rocket_collision)
 
-    def setup_gpu_acceleration(self):
-        try:
-            compute_shader = Shader.load_compute(Shader.SL_GLSL, "collision_compute.glsl")
-            render_shader = Shader.load(Shader.SL_GLSL, vertex="bullet_vert.glsl", fragment="bullet_frag.glsl")
-        except Exception as e:
-            print(f"Error loading shaders: {e}")
-            self.userExit()
-            return
+    def setup_cpu_simulation(self):
+        vformat = GeomVertexFormat.get_v3c4()
+        self.bullet_vdata = GeomVertexData("bullets", vformat, Geom.UH_dynamic)
         
-        rocket_struct_size = 32
-        bullet_struct_size = 32
-        
-        self.rocket_buffer = Texture()
-        self.rocket_buffer.setup_buffer_texture(STARTING_ROCKETS * rocket_struct_size, Texture.T_float, Texture.F_rgba32, Geom.UH_dynamic)
-        
-        self.bullet_buffer = Texture()
-        self.bullet_buffer.setup_buffer_texture(MAX_BULLETS * bullet_struct_size, Texture.T_float, Texture.F_rgba32, Geom.UH_dynamic)
-
-        vformat = GeomVertexFormat.get_v3()
-        vdata = GeomVertexData("bullets", vformat, Geom.UH_static)
-        vdata.setNumRows(MAX_BULLETS)
         prim = GeomPoints(Geom.UH_static)
-        
-        # --- THIS IS THE FIX ---
-        prim.addConsecutiveVertices(0, MAX_BULLETS)
 
-        geom = Geom(vdata)
+        geom = Geom(self.bullet_vdata)
         geom.addPrimitive(prim)
+
         node = GeomNode('bullet_geom')
         node.addGeom(geom)
-        self.bullet_node = self.render.attachNewNode(node)
-        self.bullet_node.setShader(render_shader)
-        self.bullet_node.setShaderInput("BulletBuffer", self.bullet_buffer)
-        self.bullet_node.set_render_mode_thickness(5)
-        self.bullet_node.set_attrib(RenderModeAttrib.make(RenderModeAttrib.M_point))
+        self.bullet_geom_node = self.render.attachNewNode(node)
         
-        self.compute_node = NodePath("compute_manager")
-        self.compute_node.setShader(compute_shader)
-        self.compute_node.setShaderInput("RocketBuffer", self.rocket_buffer)
-        self.compute_node.setShaderInput("BulletBuffer", self.bullet_buffer)
-        self.compute_node.setShaderInput("world_radius", WORLD_RADIUS)
-        self.compute_node.setShaderInput("num_rockets", STARTING_ROCKETS)
+        self.bullet_geom_node.set_render_mode_thickness(5)
+        self.bullet_geom_node.set_attrib(RenderModeAttrib.make(RenderModeAttrib.M_point))
+        self.bullet_geom_node.setLightOff()
+        self.bullet_geom_node.setColor(BULLET_COLOR)
+
 
     def set_key(self, key, value):
         self.key_map[key] = value
@@ -343,7 +362,7 @@ class RocketSphere(ShowBase):
         self.taskMgr.remove("TitleScreenUpdate")
         if self.game_active: self.taskMgr.remove("GameLoop")
         self.start_game()
-        
+
     def generate_spawn_points(self, num_points):
         points = []
         phi = math.pi * (3. - math.sqrt(5.))
@@ -353,47 +372,27 @@ class RocketSphere(ShowBase):
             theta = phi * i
             x = math.cos(theta) * radius
             z = math.sin(theta) * radius
-            points.append(Point3(x, y, z) * WORLD_RADIUS)
+            points.append(Point3(x, y, z) * STARTING_WORLD_RADIUS)
         return points
-
-    # In the start_game method
 
     def start_game(self):
         self.cleanup_game()
         self.clear_ui()
+        self.current_world_radius = STARTING_WORLD_RADIUS
         self.create_world()
-        self.setup_gpu_acceleration()
-        
+        self.setup_cpu_simulation()
+
         spawn_points = self.generate_spawn_points(STARTING_ROCKETS)
         random.shuffle(spawn_points)
 
-        # --- FIX IS HERE ---
-        # Use a bytearray instead of PTA_float for mixed data types.
-        buffer_size_bytes = STARTING_ROCKETS * 32
-        rocket_data = bytearray(buffer_size_bytes)
-        
         for i in range(STARTING_ROCKETS):
             is_player = (i == 0)
             pos = spawn_points[i]
             rocket = Rocket(self, pos, is_player=is_player)
-            
-            # This attribute is needed to find the rocket's data in the buffer later
-            rocket.buffer_index = i
-            
             self.all_rockets.append(rocket)
             if is_player: self.player_ref = rocket
             rocket.reparentTo(self.render)
             self.cTrav.addCollider(rocket.c_np, self.coll_handler)
-
-            hitbox_world_pos = self.render.getRelativePoint(rocket, rocket.hitbox_collision_pos)
-            # Pack data into the bytearray
-            struct.pack_into('3f f i 3f', rocket_data, i * 32, 
-                            hitbox_world_pos.x, hitbox_world_pos.y, hitbox_world_pos.z,
-                            ROCKET_HITBOX_RADIUS, 1, 0, 0, 0)
-
-        # This will now work correctly with the bytearray
-        self.rocket_buffer.set_ram_image(rocket_data)
-        self.bullet_write_index = 0
 
         self.setup_camera()
         self.game_active = True
@@ -402,11 +401,15 @@ class RocketSphere(ShowBase):
     def cleanup_game(self):
         for r in self.all_rockets: r.destroy()
         self.all_rockets, self.player_ref = [], None
+        self.all_bullets = []
         if hasattr(self, 'world_sphere'): self.world_sphere.removeNode()
-        if self.bullet_node: self.bullet_node.removeNode()
+        if self.bullet_geom_node: self.bullet_geom_node.removeNode()
+        self.bullet_geom_node = None
+        self.bullet_vdata = None
 
     def create_world(self):
-        self.world_sphere = create_icosphere(subdivisions=5); self.world_sphere.setScale(WORLD_RADIUS)
+        self.world_sphere = create_icosphere(subdivisions=5)
+        self.world_sphere.setScale(self.current_world_radius)
         mat = Material(); base_color = LColor(0.1, 0.15, 0.3, 1)
         mat.setAmbient(base_color * 0.6); mat.setDiffuse(base_color * 0.9)
         self.world_sphere.setMaterial(mat, 1); self.world_sphere.reparentTo(self.render)
@@ -415,17 +418,26 @@ class RocketSphere(ShowBase):
     def _create_world_grid(self, num_lat=18, num_lon=36):
         ls = LineSegs("grid"); ls.setThickness(1.0); ls.setColor(0.2, 0.3, 0.6, 0.8)
         radius = 1.005
+        # Latitude lines
         for i in range(1, num_lat):
-            lat = math.pi * i/num_lat - math.pi/2; r, z = radius * math.cos(lat), radius * math.sin(lat)
+            lat = math.pi * i / num_lat - math.pi / 2
+            r = radius * math.cos(lat)
+            z = radius * math.sin(lat)
             for j in range(num_lon + 1):
-                lon = 2 * math.pi * j / num_lon; x, y = r * math.cos(lon), r * math.sin(lon)
+                lon = 2 * math.pi * j / num_lon
+                x = r * math.cos(lon)
+                y = r * math.sin(lon)
                 if j == 0: ls.moveTo(x, y, z)
                 else: ls.drawTo(x, y, z)
+        # Longitude lines
         for i in range(num_lon):
             lon = 2 * math.pi * i / num_lon
             for j in range(num_lat + 1):
-                lat = math.pi * j / num_lat - math.pi / 2; r, z = radius * math.cos(lat), radius * math.sin(lon)
-                x, y = r * math.cos(lon), r * math.sin(lon)
+                lat = math.pi * j / num_lat - math.pi / 2
+                r = radius * math.cos(lat)
+                z = radius * math.sin(lat)
+                x = r * math.cos(lon)
+                y = r * math.sin(lon)
                 if j == 0: ls.moveTo(x, y, z)
                 else: ls.drawTo(x, y, z)
         node = NodePath(ls.create()); node.setLightOff(); return node
@@ -442,7 +454,7 @@ class RocketSphere(ShowBase):
         self.zoom_level = max(MIN_ZOOM, min(self.zoom_level, MAX_ZOOM))
 
     def update_camera(self, dt):
-        if not self.player_ref: return
+        if not self.player_ref or not self.player_ref.is_active: return
         rocket_pos = self.player_ref.getPos()
         up_vec = normalized_vector(rocket_pos)
         target_pos = rocket_pos + up_vec * self.zoom_level
@@ -460,95 +472,129 @@ class RocketSphere(ShowBase):
         current_rockets = len(self.all_rockets)
         progress = (start_count - current_rockets) / rocket_range
         progress = max(0.0, min(1.0, progress))
-        eased_progress = progress ** 2 
+        eased_progress = progress ** 2
         time_range = MAX_TIME_DILATOR - MIN_TIME_DILATOR
         self.time_dilator = MIN_TIME_DILATOR + (eased_progress * time_range)
 
-    def game_loop(self, task):
-        if not self.game_active: return Task.done
-        
-        self.update_time_dilator()
-        dt = globalClock.getDt() * self.time_dilator
-        dt = min(dt, 1/30.0) 
-        
-        rocket_data_view = self.rocket_buffer.modify_ram_image()
-        rockets_to_remove = []
-        
-        for i, rocket in enumerate(self.all_rockets):
-            is_active = struct.unpack_from('i', rocket_data_view, rocket.buffer_index * 32 + 16)[0]
-            if is_active == 0:
-                rockets_to_remove.append(rocket)
+    def update_bullets_cpu(self, dt):
+        rockets_to_destroy = set()
+        for bullet in self.all_bullets:
+            if not bullet.is_active: continue
+
+            bullet.age += dt
+            if bullet.age > BULLET_LIFETIME:
+                bullet.is_active = False
                 continue
 
-            if rocket.is_player: rocket.control(dt)
-            else:
-                other_rockets = [r for r in self.all_rockets if r != rocket]
-                rocket.update_ai(dt, other_rockets)
-            rocket.update(dt)
-            
-            hitbox_world_pos = self.render.getRelativePoint(rocket, rocket.hitbox_collision_pos)
-            struct.pack_into('3f', rocket_data_view, rocket.buffer_index * 32, hitbox_world_pos.x, hitbox_world_pos.y, hitbox_world_pos.z)
-        
-        if rockets_to_remove:
-            active_rockets = []
+            new_pos = bullet.pos + bullet.velocity * dt
+            new_pos_norm = normalized_vector(new_pos)
+            bullet.pos = new_pos_norm * self.current_world_radius
+            bullet.velocity -= new_pos_norm * bullet.velocity.dot(new_pos_norm)
+
             for rocket in self.all_rockets:
-                if rocket in rockets_to_remove:
-                    rocket.destroy()
-                else:
-                    active_rockets.append(rocket)
-            self.all_rockets = active_rockets
-            
-            # --- FIX IS HERE ---
-            # Re-build the rocket buffer from scratch using a bytearray
-            new_buffer_size = len(self.all_rockets) * 32
-            rocket_data = bytearray(new_buffer_size)
+                if not rocket.is_active or rocket == bullet.shooter:
+                    continue
+                
+                dist_sq = (bullet.pos - rocket.getPos()).length_squared()
+                min_dist = ROCKET_HITBOX_RADIUS + BULLET_RADIUS
+                if dist_sq < min_dist * min_dist:
+                    rockets_to_destroy.add(rocket)
+                    bullet.is_active = False
+                    # NEW: Register the kill for the shooter
+                    if bullet.shooter and bullet.shooter.is_active:
+                        bullet.shooter.register_kill()
+                    break
 
-            for i, rocket in enumerate(self.all_rockets):
-                rocket.buffer_index = i
-                hitbox_world_pos = self.render.getRelativePoint(rocket, rocket.hitbox_collision_pos)
-                struct.pack_into('3f f i 3f', rocket_data, i * 32, hitbox_world_pos.x, hitbox_world_pos.y, hitbox_world_pos.z, ROCKET_HITBOX_RADIUS, 1, 0, 0, 0)
-            
-            # To resize the buffer, you must re-setup the texture before setting the image
-            self.rocket_buffer.setup_buffer_texture(new_buffer_size, Texture.T_float, Texture.F_rgba32, Geom.UH_dynamic)
-            self.rocket_buffer.set_ram_image(rocket_data)
-
-
-        self.compute_node.setShaderInput("dt", dt)
-        self.compute_node.setShaderInput("num_rockets", len(self.all_rockets))
-        attrib = self.compute_node.getAttrib(ShaderAttrib)
-        self.win.get_gsg().dispatch_compute((MAX_BULLETS // COMPUTE_GROUP_SIZE, 1, 1), attrib)
+        self.all_bullets = [b for b in self.all_bullets if b.is_active]
         
+        for rocket in rockets_to_destroy:
+            rocket.is_active = False
+
+    def update_bullet_geom(self):
+        vdata = self.bullet_geom_node.node().modifyGeom(0).modifyVertexData()
+        vdata.setNumRows(len(self.all_bullets))
+
+        vertex_writer = GeomVertexWriter(vdata, 'vertex')
+        color_writer = GeomVertexWriter(vdata, 'color')
+        
+        for bullet in self.all_bullets:
+            vertex_writer.setData3(bullet.pos)
+            color_writer.setData4(BULLET_COLOR)
+        
+        prim = self.bullet_geom_node.node().modifyGeom(0).modifyPrimitive(0)
+        
+        prim.clearVertices()
+        prim.addConsecutiveVertices(0, len(self.all_bullets))
+
+    def update_world_shrink(self, dt):
+        rocket_range = float(STARTING_ROCKETS - 2)
+        if rocket_range <= 0:
+            target_radius = MIN_WORLD_RADIUS
+        else:
+            progress = (len(self.all_rockets) - 2) / rocket_range
+            progress = max(0.0, min(1.0, progress))
+            
+            radius_range = STARTING_WORLD_RADIUS - MIN_WORLD_RADIUS
+            target_radius = MIN_WORLD_RADIUS + (progress * radius_range)
+
+        interp_factor = 1.0 - math.exp(-dt * WORLD_SHRINK_SPEED)
+        self.current_world_radius += (target_radius - self.current_world_radius) * interp_factor
+        
+        self.world_sphere.setScale(self.current_world_radius)
+
+    def game_loop(self, task):
+        if not self.game_active: return Task.done
+
+        self.update_time_dilator()
+        self.update_world_shrink(globalClock.getDt())
+        
+        dt = globalClock.getDt() * self.time_dilator
+        dt = min(dt, 1/30.0)
+
+        for rocket in self.all_rockets:
+            if rocket.is_player:
+                rocket.control(dt)
+            else:
+                other_rockets = [r for r in self.all_rockets if r != rocket and r.is_active]
+                # MODIFIED: Pass all bullets to the AI for evasion checks
+                rocket.update_ai(dt, other_rockets, self.all_bullets)
+            rocket.update(dt)
+        
+        self.update_bullets_cpu(dt)
+        
+        self.update_bullet_geom()
+
+        rockets_to_remove = [r for r in self.all_rockets if not r.is_active]
+        if rockets_to_remove:
+            self.all_rockets = [r for r in self.all_rockets if r.is_active]
+            for r in rockets_to_remove:
+                r.destroy()
+
         self.handle_zoom(dt)
         self.update_camera(dt)
         self.update_game_ui()
         self.cTrav.traverse(self.render)
 
         if self.game_active:
-            if self.player_ref and self.player_ref not in self.all_rockets:
+            is_player_alive = self.player_ref and self.player_ref.is_active
+            if not is_player_alive:
                 self.handle_game_over()
-            elif self.player_ref and len(self.all_rockets) == 1 and self.all_rockets[0].is_player:
+            elif len(self.all_rockets) == 1 and self.all_rockets[0].is_player:
                 self.handle_game_won()
-        
+
         return Task.cont
 
+    # MODIFIED: Accept a shooter object to track kills
     def spawn_bullet(self, pos, direction, shooter):
-        ptr = self.bullet_buffer.modify_ram_image()
-        offset = self.bullet_write_index * 32
-        struct.pack_into('3f f 3f f', ptr, offset,
-                         pos.x, pos.y, pos.z, 0.0,
-                         direction.x * BULLET_SPEED, direction.y * BULLET_SPEED, direction.z * BULLET_SPEED,
-                         BULLET_LIFETIME)
-        self.bullet_write_index = (self.bullet_write_index + 1) % MAX_BULLETS
-    
+        vel = direction * BULLET_SPEED
+        bullet = Bullet(pos, vel, shooter)
+        self.all_bullets.append(bullet)
+
     def on_rocket_collision(self, entry):
-        rocket1_np = entry.getFromNodePath().getParent(); rocket2_np = entry.getIntoNodePath().getParent()
-        rocket1 = rocket1_np.getPythonTag("owner"); rocket2 = rocket2_np.getPythonTag("owner")
-        if not rocket1 or not rocket2: return
-
-        # Mark for removal
-        rocket1.is_active = 0
-        rocket2.is_active = 0
-
+        rocket1 = entry.getFromNodePath().getNetPythonTag("owner")
+        rocket2 = entry.getIntoNodePath().getNetPythonTag("owner")
+        if rocket1: rocket1.is_active = False
+        if rocket2: rocket2.is_active = False
 
     def handle_game_over(self):
         if not self.game_active: return
@@ -564,7 +610,8 @@ class RocketSphere(ShowBase):
 
     def update_game_ui(self):
         if not self.game_active: return
-        health_text = f"Hull Integrity: {'100%' if self.player_ref else 'BREACHED'}"
+        is_player_alive = self.player_ref and self.player_ref.is_active
+        health_text = f"Hull Integrity: {'100%' if is_player_alive else 'BREACHED'}"
         rockets_left_text = f"Rockets Left: {len(self.all_rockets)}"
         speed_text = f"Game Speed: {self.time_dilator:.2f}x"
         self.update_ui_text("Health", health_text, (-1.3, 0.9), 0.05, align=TextNode.ALeft)
@@ -575,17 +622,21 @@ class RocketSphere(ShowBase):
         self.clear_ui()
         self.update_ui_text("Title", "ROCKET SPHERE", (0, 0.5), 0.12)
         self.update_ui_text("StartPrompt", "Press R to Start\nA/D to Steer | W/S to Zoom\nSpace to Shoot", (0, 0.2), 0.07)
+        self.current_world_radius = STARTING_WORLD_RADIUS
         self.create_world()
-        self.camera.setPos(0, -WORLD_RADIUS * 3, WORLD_RADIUS * 1.5); self.camera.lookAt(0, 0, 0)
+        self.camera.setPos(0, -STARTING_WORLD_RADIUS * 3, STARTING_WORLD_RADIUS * 1.5); self.camera.lookAt(0, 0, 0)
         self.taskMgr.add(self.title_screen_update, "TitleScreenUpdate")
+
     def title_screen_update(self, task):
         if self.game_active: return Task.done
         if hasattr(self, 'world_sphere'): self.world_sphere.setH(self.world_sphere.getH() + globalClock.getDt() * 5)
         return Task.cont
+
     def update_ui_text(self, key, text, pos, scale=0.05, align=TextNode.ACenter, color=TEXT_COLOR):
         if key in self.ui_elements:
             self.ui_elements[key].setText(text); self.ui_elements[key].setFg(color)
         else: self.ui_elements[key] = OnscreenText(text=text, pos=pos, scale=scale, fg=color, align=align, mayChange=True, parent=self.aspect2d)
+
     def clear_ui(self):
         for e in self.ui_elements.values(): e.destroy()
         self.ui_elements.clear()
