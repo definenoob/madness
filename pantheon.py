@@ -8,19 +8,18 @@ from panda3d.core import (
     AmbientLight, DirectionalLight,
     NodePath, TextNode,
     GeomVertexFormat, GeomVertexData, Geom, GeomTriangles, GeomPoints, GeomNode, GeomVertexWriter,
-    LineSegs, Quat,
-    RenderModeAttrib
+    LineSegs, RenderModeAttrib, BoundingSphere
 )
 from direct.gui.OnscreenText import OnscreenText
 from direct.task import Task
 
 # --- Configuration & Constants ---
-STARTING_WORLD_RADIUS = 350.0
+STARTING_WORLD_RADIUS = 450.0
 MIN_WORLD_RADIUS = 50.0
 WORLD_SHRINK_SPEED = 0.5
 
 # Time Dilation Settings
-STARTING_ROCKETS = 100
+STARTING_ROCKETS = 200
 MIN_TIME_DILATOR = 0.5
 MAX_TIME_DILATOR = 1.0
 
@@ -74,7 +73,7 @@ WIN_COLOR = LColor(0.2, 1.0, 0.6, 1)
 # P&L Tracking Constants
 ANTE_COST = 0.25
 KILL_REWARD = 0.20
-WIN_BONUS = 5.00
+WIN_BONUS = 10.00
 
 
 # --- CPU BULLET CLASS ---
@@ -172,6 +171,7 @@ class Rocket(NodePath):
         mat = Material(); mat.setAmbient(color*0.5); mat.setDiffuse(color*0.9); mat.setEmission(color*0.2)
         self.model.setMaterial(mat, 1)
         self.setScale(scale)
+
         self.setPos(pos)
 
         self.speed = ROCKET_FORWARD_SPEED
@@ -571,13 +571,12 @@ class RocketSphere(ShowBase):
 
                 # --- Cone Collision Detection ---
                 # Transform bullet's world position to the rocket's local space.
-                # In local space, the cone model has height=2.0 and radius=0.7.
                 bullet_local_pos = rocket.getRelativePoint(self.render, bullet.pos)
 
                 # Define the cone's properties based on its original model dimensions
                 cone_height = 2.0
                 cone_radius = 0.7
-                apex_y = cone_height / 2.0  # Cone points along positive Y
+                apex_y = cone_height / 2.0
                 base_y = -cone_height / 2.0
 
                 # Unpack bullet's local coordinates for clarity
@@ -588,9 +587,8 @@ class RocketSphere(ShowBase):
                     continue
 
                 # 2. Calculate the cone's radius at the bullet's y-position
-                # This is a linear interpolation from apex (radius=0) to base (radius=cone_radius)
                 interp_factor = (apex_y - by) / cone_height
-                radius_at_y = cone_radius * interp_factor
+                radius_at_y = cone_radius * (1.0 - interp_factor)
                 
                 # 3. Calculate the bullet's squared distance from the cone's central axis (the Y-axis)
                 dist_sq_from_axis = bx * bx + bz * bz
@@ -604,7 +602,7 @@ class RocketSphere(ShowBase):
                         bullet.shooter.register_kill()
                         if bullet.shooter.is_player:
                             self.round_pnl += KILL_REWARD
-                    break # Bullet is used up, move to the next bullet
+                    break 
 
         self.all_bullets = [b for b in self.all_bullets if b.is_active]
         for rocket in rockets_to_destroy:
@@ -612,16 +610,37 @@ class RocketSphere(ShowBase):
 
     def update_bullet_geom(self):
         if not self.bullet_geom_node or self.bullet_geom_node.is_empty(): return
+        
+        visible_bullets = []
+        cam_pos = self.camera.getPos()
+        cam_dist = cam_pos.length()
+        
+        perform_sphere_cull = cam_dist > self.current_world_radius
+        if perform_sphere_cull:
+            visibility_cosine_threshold = self.current_world_radius / cam_dist
+            cam_norm = cam_pos / cam_dist
+
+        for bullet in self.all_bullets:
+            # Sphere Occlusion Culling
+            if perform_sphere_cull:
+                bullet_norm = bullet.pos.normalized()
+                angle_cosine = cam_norm.dot(bullet_norm)
+                if angle_cosine <= visibility_cosine_threshold:
+                    continue # Occluded by sphere, skip
+            
+            # If we reach here, the bullet is visible
+            visible_bullets.append(bullet)
+
         vdata = self.bullet_geom_node.node().modifyGeom(0).modifyVertexData()
-        vdata.setNumRows(len(self.all_bullets))
+        vdata.setNumRows(len(visible_bullets))
         vertex_writer = GeomVertexWriter(vdata, 'vertex')
         color_writer = GeomVertexWriter(vdata, 'color')
-        for bullet in self.all_bullets:
+        for bullet in visible_bullets:
             vertex_writer.setData3(bullet.pos)
             color_writer.setData4(BULLET_COLOR)
         prim = self.bullet_geom_node.node().modifyGeom(0).modifyPrimitive(0)
         prim.clearVertices()
-        prim.addConsecutiveVertices(0, len(self.all_bullets))
+        prim.addConsecutiveVertices(0, len(visible_bullets))
 
     def update_world_shrink(self, dt):
         rocket_range = float(STARTING_ROCKETS - 2)
@@ -640,6 +659,33 @@ class RocketSphere(ShowBase):
         self.update_world_shrink(globalClock.getDt())
         dt = min(globalClock.getDt() * self.time_dilator, 1/30.0)
         
+        # --- Culling Setup ---
+        cam_pos = self.camera.getPos()
+        cam_dist = cam_pos.length()
+
+        perform_sphere_cull = cam_dist > self.current_world_radius
+        if perform_sphere_cull:
+            visibility_cosine_threshold = self.current_world_radius / cam_dist
+            cam_norm = cam_pos / cam_dist
+        
+        # --- Rocket Visibility Update ---
+        for rocket in self.all_rockets:
+            is_visible = True # Default to visible
+
+            # Sphere Occlusion Culling
+            if perform_sphere_cull and rocket != self.player_ref:
+                rocket_norm = rocket.getPos().normalized()
+                angle_cosine = cam_norm.dot(rocket_norm)
+                if angle_cosine <= visibility_cosine_threshold:
+                    is_visible = False
+            
+            # Apply visibility
+            if is_visible:
+                if rocket.isHidden(): rocket.show()
+            else:
+                if not rocket.isHidden(): rocket.hide()
+
+        # --- Rocket Logic Update ---
         for rocket in self.all_rockets:
             if rocket.is_player:
                 rocket.control(dt)
