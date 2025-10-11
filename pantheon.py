@@ -36,32 +36,26 @@ ROCKET_HITBOX_RADIUS = 0.75
 ROCKET_BODY_RADIUS = 0.75
 BULLET_RADIUS = 0.5
 BULLET_SPEED = 90.0
-BULLET_LIFETIME = 1.0 # This is now the fixed lifetime for all bullets
-SHOOT_COOLDOWN = 0.6
+BULLET_LIFETIME = 2.0 # This is now the fixed lifetime for all bullets
+SHOOT_COOLDOWN = 0.1
 
 # AI Settings
 AI_OPTIMAL_DISTANCE = 60.0
-AI_SHOOT_RANGE = 90.0
-# Pathfinding constants
-AI_PATHFINDING_RADIUS = 75.0 # How far the AI "looks" for bullets to pathfind around
-AI_PATHFINDING_LEAD_TIME = 0.75 # How far ahead in time it projects its path
-AI_FEELER_ANGLE = 30.0 # Angle of the pathfinding "feelers"
-# Evasion constants
-AI_TAIL_AWARENESS_RADIUS = 70.0
-AI_TAIL_DOT_THRESHOLD = -0.9 # How directly behind a pursuer must be
-AI_TAIL_AIM_THRESHOLD = 0.95 # How accurately the pursuer must be aiming
-AI_OPPORTUNISTIC_SHOT_THRESHOLD = 0.98 # How accurately the AI must be aiming for a potshot
+AI_SHOOT_RANGE = 100.0 # Increased aggression
 # Targeting constants
 AI_PRIORITY_DISTANCE_WEIGHT = 0.8
 AI_PRIORITY_KILLS_WEIGHT = 0.25
-### NEW ###
-# Desperation move constants
-AI_SURROUNDED_RADIUS = 60.0 # Distance to check for nearby enemies
-AI_SURROUNDED_THRESHOLD = 3  # Number of enemies to trigger panic
-AI_PANIC_SPIN_SPEED = 120.0  # How fast it spins during the move
-AI_PANIC_DURATION_MIN = 1.0  # Minimum duration of the panic state in seconds
-AI_PANIC_DURATION_MAX = 2.5  # Maximum duration of the panic state in seconds
-
+# Advanced AI Settings
+AI_LEAD_SHOT_ACCURACY = 0.90 # Cosine of angle for firing a predictive shot
+# Ace and Jinking constants
+AI_ACE_CHANCE = 0.00 # 20% chance for an AI to be an "Ace"
+AI_ACE_SPEED_BONUS = 1.1 # 10% faster
+AI_ACE_TURN_BONUS = 1.25 # 25% more agile
+AI_JINK_INTERVAL = 1.5 # How often an AI considers jinking
+AI_JINK_CHANCE = 0.9 # 50% chance to jink when the timer is up
+AI_JINK_DURATION = 0.3 # How long the jink maneuver lasts
+# Spin Bot settings
+NUM_SPIN_BOTS = 10
 
 # Camera Settings
 CAMERA_CHASE_SPEED = 4.0
@@ -74,10 +68,16 @@ ZOOM_SPEED = 150.0
 BACKGROUND_COLOR = LColor(0.08, 0.08, 0.12, 1)
 PLAYER_COLOR = LColor(0.1, 0.6, 1.0, 1)
 ENEMY_COLOR = LColor(1, 0.2, 0.2, 1)
+SPIN_BOT_COLOR = LColor(0.9, 0.1, 0.7, 1) # Bright magenta for spin bots
 BULLET_COLOR = LColor(1.0, 0.8, 0.5, 1)
 HITBOX_COLOR = LColor(1, 0.75, 0.05, 1)
 TEXT_COLOR = LColor(0.94, 0.94, 0.94, 1)
 WIN_COLOR = LColor(0.2, 1.0, 0.6, 1)
+
+# P&L Tracking Constants
+ANTE_COST = 0.25
+KILL_REWARD = 0.20
+WIN_BONUS = 5.00
 
 
 # --- CPU BULLET CLASS ---
@@ -152,14 +152,21 @@ def normalized_vector(v):
 
 # --- Game Classes ---
 class Rocket(NodePath):
-    def __init__(self, game, pos, is_player=False):
+    def __init__(self, game, pos, is_player=False, is_spin_bot=False):
         super().__init__("Rocket")
         self.game = game
         self.is_player = is_player
+        self.is_spin_bot = is_spin_bot
         self.is_active = True
         self.kills = 0
+        self.is_ace = False
 
-        color = PLAYER_COLOR if self.is_player else ENEMY_COLOR
+        if self.is_player:
+            color = PLAYER_COLOR
+        elif self.is_spin_bot:
+            color = SPIN_BOT_COLOR
+        else:
+            color = ENEMY_COLOR
         
         scale = Vec3(1.5, 2.5, 1.5)
         self.model = create_cone()
@@ -172,6 +179,13 @@ class Rocket(NodePath):
 
         self.speed = ROCKET_FORWARD_SPEED
         self.base_turn_speed = ROCKET_TURN_SPEED
+        
+        if not self.is_player and not self.is_spin_bot and random.random() < AI_ACE_CHANCE:
+            self.is_ace = True
+            self.speed *= AI_ACE_SPEED_BONUS
+            self.base_turn_speed *= AI_ACE_TURN_BONUS
+            self.model.setScale(1.2) 
+
         self.current_turn_speed = self.base_turn_speed
         self._last_forward = self.calculate_initial_forward()
         self.velocity = self._last_forward * self.speed
@@ -179,13 +193,10 @@ class Rocket(NodePath):
         self.target = None
         self.look_at_sphere_surface()
 
-        # State for tail evasion maneuver
-        self.evasion_timer = 0.0
         self.evade_dir = 1
         
-        ### NEW ###
-        # State for desperation move
-        self.panic_timer = 0.0
+        self.jink_timer = random.uniform(0, AI_JINK_INTERVAL)
+        self.jinking_time_left = 0.0
 
         self.hitbox_collision_pos = Point3(0, -1.0, 0)
         hitbox_model = create_icosphere(1)
@@ -231,6 +242,8 @@ class Rocket(NodePath):
             self.velocity -= new_pos_norm * self.velocity.dot(new_pos_norm)
         self.look_at_sphere_surface()
         if self.shoot_timer > 0: self.shoot_timer -= dt
+        if not self.is_player:
+            if self.jink_timer > 0: self.jink_timer -= dt
 
     def shoot(self):
         if self.shoot_timer <= 0:
@@ -238,7 +251,6 @@ class Rocket(NodePath):
             spawn_pos = self.getPos() + self._last_forward * 4.0
             self.game.spawn_bullet(spawn_pos, self._last_forward, self)
             
-            # Apply all penalties instantly on firing
             self.speed *= 0.99
             self.velocity = normalized_vector(self.velocity) * self.speed
             self.current_turn_speed *= (1.0 - TURN_PENALTY_ON_MISS)
@@ -259,6 +271,7 @@ class Rocket(NodePath):
         highest_priority = -1.0
         my_pos = self.getPos()
         if not all_other_rockets: return None
+        
         for r in all_other_rockets:
             if not r.is_active: continue
             dist = (my_pos - r.getPos()).length()
@@ -269,132 +282,82 @@ class Rocket(NodePath):
                 best_target = r
         return best_target
 
-    def evaluate_path_danger(self, path_dir, all_bullets):
-        danger = 0.0
-        projected_pos = self.getPos() + path_dir * self.speed * AI_PATHFINDING_LEAD_TIME
-        
-        for bullet in all_bullets:
-            if not bullet.is_active or bullet.shooter == self:
-                continue
-
-            vec_to_path = projected_pos - bullet.pos
-            dist_sq = vec_to_path.length_squared()
-
-            if dist_sq < AI_PATHFINDING_RADIUS ** 2:
-                threat = 1.0 / (dist_sq + 1.0)
-                dir_to_path = normalized_vector(vec_to_path)
-                bullet_dir = normalized_vector(bullet.velocity)
-                dot = bullet_dir.dot(dir_to_path)
-
-                if dot > 0:
-                    threat *= (1 + dot * 2)
-
-                danger += threat
-        return danger
+    def get_intercept_solution(self, target):
+        my_pos = self.getPos()
+        target_pos = target.getPos()
+        target_vel = target.velocity
+        dist = (target_pos - my_pos).length()
+        time_to_impact = dist / BULLET_SPEED
+        for _ in range(3):
+            predicted_pos = target_pos + target_vel * time_to_impact
+            predicted_pos.normalize()
+            predicted_pos *= self.game.current_world_radius
+            dist = (predicted_pos - my_pos).length()
+            time_to_impact = dist / BULLET_SPEED
+        aim_dir = normalized_vector(predicted_pos - my_pos)
+        return aim_dir
 
     def update_ai(self, dt, all_other_rockets, all_bullets):
+        # --- Spin Bot Logic ---
+        if self.is_spin_bot:
+            # 1. Spin continuously
+            up = normalized_vector(self.getPos())
+            forward = normalized_vector(self.velocity)
+            right = forward.cross(up)
+            # Use a constant turn value of 1 to always turn in one direction
+            turn_force = right * 1.0 * self.current_turn_speed
+            self.velocity = normalized_vector(self.velocity + turn_force * dt) * self.speed
+            
+            # 2. Shoot as fast as possible
+            self.shoot()
+            
+            # Skip the normal AI routine
+            return
+
+        # --- Standard AI Logic ---
         my_pos = self.getPos()
         my_forward = normalized_vector(self.velocity)
         up = normalized_vector(my_pos)
         right = my_forward.cross(up)
         
-        ### NEW ###
-        # --- 1. Highest Priority: Desperation Spin-and-Shoot ---
-        if self.panic_timer > 0:
-            self.panic_timer -= dt
-            # Spin rapidly in a random direction (chosen once at the start of panic)
-            turn_force = right * self.evade_dir * AI_PANIC_SPIN_SPEED
-            self.velocity = normalized_vector(self.velocity + turn_force * dt) * self.speed
-            # Shoot as fast as possible
-            self.shoot()
-            return # Skip all other logic
-
-        # Check if we should ENTER the panic state
-        surrounded_count = 0
-        for r in all_other_rockets:
-            if (r.getPos() - my_pos).length_squared() < AI_SURROUNDED_RADIUS ** 2:
-                surrounded_count += 1
-        
-        if surrounded_count >= AI_SURROUNDED_THRESHOLD:
-            self.panic_timer = random.uniform(AI_PANIC_DURATION_MIN, AI_PANIC_DURATION_MAX)
-            self.evade_dir = random.choice([-1, 1]) # Pick a spin direction
-            return # End AI logic for this frame, panic will start next frame
-
-        target_velocity_dir = None
-        
-        # --- 2. High Priority: Evade a tailing rocket ---
-        tailing_rocket = None
-        for r in all_other_rockets:
-            vec_to_r = r.getPos() - my_pos
-            dist_sq = vec_to_r.length_squared()
-
-            if dist_sq < AI_TAIL_AWARENESS_RADIUS ** 2:
-                if my_forward.dot(normalized_vector(r.getPos() - my_pos)) < AI_TAIL_DOT_THRESHOLD:
-                    their_forward = normalized_vector(r.velocity)
-                    vec_from_them_to_me = my_pos - r.getPos()
-                    if their_forward.dot(normalized_vector(vec_from_them_to_me)) > AI_TAIL_AIM_THRESHOLD:
-                        tailing_rocket = r
-                        break
-
-        if tailing_rocket:
-            if self.evasion_timer <= 0:
-                self.evasion_timer = random.uniform(0.5, 1.2)
-                self.evade_dir = random.choice([-1, 1])
-            target_velocity_dir = right * self.evade_dir
-            self.evasion_timer -= dt
-        
-        # --- 3. Medium Priority: Pathfind through bullets ---
-        if target_velocity_dir is None:
-            self.evasion_timer = 0
-            q = Quat()
-            q.setFromAxisAngle(AI_FEELER_ANGLE, up)
-            dir_left = q.xform(my_forward)
-            
-            q.setFromAxisAngle(-AI_FEELER_ANGLE, up)
-            dir_right = q.xform(my_forward)
-
-            danger_straight = self.evaluate_path_danger(my_forward, all_bullets)
-            danger_left = self.evaluate_path_danger(dir_left, all_bullets)
-            danger_right = self.evaluate_path_danger(dir_right, all_bullets)
-
-            if danger_straight <= danger_left and danger_straight <= danger_right:
-                target_velocity_dir = my_forward
-            elif danger_left < danger_right:
-                target_velocity_dir = dir_left
-            else:
-                target_velocity_dir = dir_right
-
-        if target_velocity_dir is None:
-             target_velocity_dir = my_forward
-
-        # --- 4. Low Priority: Hunt a target ---
-        if not self.target or not self.target.is_active or random.random() < 0.05:
-            self.target = self.select_target(all_other_rockets)
-        
-        if self.target:
-            target_pos = self.target.getPos()
-            target_forward = normalized_vector(self.target.velocity) if self.target.velocity.length_squared() > 0 else self.target._last_forward
-            tail_position = target_pos - target_forward * AI_OPTIMAL_DISTANCE
-            dir_to_tail = (tail_position - my_pos)
-            dir_to_tail_on_plane = (dir_to_tail - up * dir_to_tail.dot(up)).normalized()
-            
-            final_dir = (target_velocity_dir * 0.6 + dir_to_tail_on_plane * 0.4).normalized()
-        else:
-            final_dir = target_velocity_dir
-
-        if final_dir.length_squared() > 0:
-            self.velocity = normalized_vector(self.velocity + final_dir * self.current_turn_speed * dt) * self.speed
-        
-        # --- 5. Independent opportunistic shooting ---
-        for potential_shot_target in all_other_rockets:
-            if not potential_shot_target.is_active: continue
-            dir_to_potential_target = normalized_vector(potential_shot_target.getPos() - my_pos)
-            angle = my_forward.dot(dir_to_potential_target)
-            dist_sq = (my_pos - potential_shot_target.getPos()).length_squared()
-
-            if dist_sq < AI_SHOOT_RANGE ** 2 and angle > AI_OPPORTUNISTIC_SHOT_THRESHOLD:
+        # 1. OFFENSE: Always be looking for a shot
+        for potential_target in all_other_rockets:
+            if not potential_target.is_active: continue
+            if (potential_target.getPos() - my_pos).length_squared() > AI_SHOOT_RANGE ** 2:
+                continue
+            aim_dir = self.get_intercept_solution(potential_target)
+            if my_forward.dot(aim_dir) > AI_LEAD_SHOT_ACCURACY:
                 self.shoot()
                 break 
+
+        # 2. SURVIVAL/MOVEMENT: Jink or Hunt
+        if self.jinking_time_left > 0:
+            self.jinking_time_left -= dt
+            turn_force = right * self.evade_dir * self.current_turn_speed * 1.5
+            self.velocity = normalized_vector(self.velocity + turn_force * dt) * self.speed
+            return
+
+        if self.jink_timer <= 0:
+            if random.random() < AI_JINK_CHANCE:
+                self.jinking_time_left = AI_JINK_DURATION
+                self.evade_dir = random.choice([-1, 1])
+                self.jink_timer = AI_JINK_INTERVAL
+                return
+            self.jink_timer = AI_JINK_INTERVAL
+
+        # If not jinking, hunt a target
+        if not self.target or not self.target.is_active or random.random() < 0.05:
+            self.target = self.select_target(all_other_rockets)
+
+        if self.target:
+            tail_position = self.target.getPos() - normalized_vector(self.target.velocity) * AI_OPTIMAL_DISTANCE
+            dir_to_tail = (tail_position - my_pos)
+            final_dir = (dir_to_tail - up * dir_to_tail.dot(up)).normalized()
+            if final_dir.length_squared() > 0:
+                self.velocity = normalized_vector(self.velocity + final_dir * self.current_turn_speed * dt) * self.speed
+        else:
+            # If no target, just cruise (jinking will handle evasion)
+            pass
 
     def destroy(self):
         self.is_active = False
@@ -421,6 +384,9 @@ class RocketSphere(ShowBase):
         self.bullet_geom_node = None
         
         self.current_world_radius = STARTING_WORLD_RADIUS
+
+        self.total_pnl = 0.0
+        self.round_pnl = 0.0
 
         self.show_title_screen()
         self.accept("escape", sys.exit)
@@ -478,6 +444,9 @@ class RocketSphere(ShowBase):
     def start_game(self):
         self.cleanup_game()
         self.clear_ui()
+
+        self.round_pnl = -ANTE_COST
+        
         self.current_world_radius = STARTING_WORLD_RADIUS
         self.create_world()
         self.setup_cpu_simulation()
@@ -487,8 +456,10 @@ class RocketSphere(ShowBase):
 
         for i in range(STARTING_ROCKETS):
             is_player = (i == 0)
+            # The first NUM_SPIN_BOTS AIs (i=1 to NUM_SPIN_BOTS) will be spin bots
+            is_spin_bot = not is_player and (i <= NUM_SPIN_BOTS)
             pos = spawn_points.pop()
-            rocket = Rocket(self, pos, is_player=is_player)
+            rocket = Rocket(self, pos, is_player=is_player, is_spin_bot=is_spin_bot)
             self.all_rockets.append(rocket)
             if is_player:
                 self.player_ref = rocket
@@ -608,6 +579,8 @@ class RocketSphere(ShowBase):
                     bullet.is_active = False
                     if bullet.shooter and bullet.shooter.is_active:
                         bullet.shooter.register_kill()
+                        if bullet.shooter.is_player:
+                            self.round_pnl += KILL_REWARD
                     break
         self.all_bullets = [b for b in self.all_bullets if b.is_active]
         for rocket in rockets_to_destroy:
@@ -641,14 +614,13 @@ class RocketSphere(ShowBase):
         if not self.game_active: return Task.done
         self.update_time_dilator()
         self.update_world_shrink(globalClock.getDt())
-        
         dt = min(globalClock.getDt() * self.time_dilator, 1/30.0)
         
         for rocket in self.all_rockets:
             if rocket.is_player:
                 rocket.control(dt)
             else:
-                other_rockets = [r for r in self.all_rockets if r != rocket and r.is_active]
+                other_rockets = [r for r in self.all_rockets if r != rocket]
                 rocket.update_ai(dt, other_rockets, self.all_bullets)
             
             rocket.update(dt)
@@ -681,13 +653,30 @@ class RocketSphere(ShowBase):
     def handle_game_over(self):
         if not self.game_active: return
         self.game_active = False; self.taskMgr.remove("GameLoop"); self.player_ref = None
-        self.update_ui_text("GameOver", "GAME OVER", (0, 0.1), 0.15, align=TextNode.ACenter, color=ENEMY_COLOR)
+        
+        self.total_pnl += self.round_pnl
+
+        self.update_ui_text("GameOver", "GAME OVER", (0, 0.2), 0.15, align=TextNode.ACenter, color=ENEMY_COLOR)
+
+        round_pnl_text = f"Round P&L: ${self.round_pnl:+.2f}"
+        round_pnl_color = WIN_COLOR if self.round_pnl > 0 else ENEMY_COLOR
+        self.update_ui_text("RoundPnlResult", round_pnl_text, (0, 0.05), 0.07, color=round_pnl_color)
+
         self.update_ui_text("RestartPrompt", "Press R to Restart", (0, -0.1), 0.07)
 
     def handle_game_won(self):
         if not self.game_active: return
         self.game_active = False; self.taskMgr.remove("GameLoop")
-        self.update_ui_text("GameWon", "YOU ARE THE LAST ONE STANDING", (0, 0.1), 0.1, align=TextNode.ACenter, color=WIN_COLOR)
+        
+        self.round_pnl += WIN_BONUS
+        self.total_pnl += self.round_pnl
+        
+        self.update_ui_text("GameWon", "YOU ARE THE LAST ONE STANDING", (0, 0.2), 0.1, align=TextNode.ACenter, color=WIN_COLOR)
+        
+        round_pnl_text = f"Round P&L: ${self.round_pnl:+.2f}"
+        round_pnl_color = WIN_COLOR if self.round_pnl > 0 else ENEMY_COLOR
+        self.update_ui_text("RoundPnlResult", round_pnl_text, (0, 0.05), 0.07, color=round_pnl_color)
+
         self.update_ui_text("RestartPrompt", "Press R to Play Again", (0, -0.1), 0.07)
 
     def update_game_ui(self):
@@ -706,6 +695,12 @@ class RocketSphere(ShowBase):
         self.update_ui_text("Enemies", rockets_left_text, (1.3, 0.9), 0.05, align=TextNode.ARight)
         self.update_ui_text("PlayerSpeed", speed_text, (-1.3, -0.9), 0.05, align=TextNode.ALeft)
         self.update_ui_text("TurnSpeed", turn_speed_text, (1.3, -0.9), 0.05, align=TextNode.ARight)
+
+        total_pnl_color = WIN_COLOR if self.total_pnl >= 0 else ENEMY_COLOR
+        self.update_ui_text("TotalPnl", f"Total P&L: ${self.total_pnl + self.round_pnl:+.2f}", (0, 0.9), 0.05, color=total_pnl_color)
+        
+        round_pnl_color = WIN_COLOR if self.round_pnl >= 0 else ENEMY_COLOR
+        self.update_ui_text("RoundPnl", f"Round P&L: ${self.round_pnl:+.2f}", (0, 0.8), 0.05, color=round_pnl_color)
 
 
     def show_title_screen(self):
